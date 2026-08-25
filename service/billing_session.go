@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -61,7 +62,20 @@ func (s *BillingSession) Settle(actualQuota int) error {
 	var tokenErr error
 	if !s.relayInfo.IsPlayground {
 		if delta > 0 {
-			tokenErr = model.DecreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, delta)
+			if s.funding.Source() == BillingSourceManagedToken {
+				var reserved bool
+				reserved, tokenErr = model.TryReserveTokenQuota(
+					s.relayInfo.TokenId,
+					s.relayInfo.TokenKey,
+					delta,
+					s.relayInfo.TokenUnlimited,
+				)
+				if tokenErr == nil && !reserved {
+					tokenErr = fmt.Errorf("managed token quota is not enough for settlement delta: %d", delta)
+				}
+			} else {
+				tokenErr = model.DecreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, delta)
+			}
 		} else {
 			tokenErr = model.IncreaseTokenQuota(s.relayInfo.TokenId, s.relayInfo.TokenKey, -delta)
 		}
@@ -242,6 +256,8 @@ func (s *BillingSession) preConsume(c *gin.Context, quota int) *types.NewAPIErro
 
 func (s *BillingSession) reserveFunding(delta int) error {
 	switch funding := s.funding.(type) {
+	case *ManagedTokenFunding:
+		return nil
 	case *WalletFunding:
 		// 与结算补扣（SettleBilling 正差额 → WalletFunding.Settle）语义一致：
 		// 全额无条件扣减，余额不足的部分记为欠费（余额可为负），不中断请求，
@@ -270,6 +286,8 @@ func (s *BillingSession) reserveFunding(delta int) error {
 
 func (s *BillingSession) rollbackFundingReserve(delta int) {
 	switch funding := s.funding.(type) {
+	case *ManagedTokenFunding:
+		return
 	case *WalletFunding:
 		if err := model.IncreaseUserQuota(funding.userId, delta, false); err != nil {
 			common.SysLog("error rolling back wallet funding reserve: " + err.Error())
@@ -357,6 +375,17 @@ func (s *BillingSession) syncRelayInfo() {
 func NewBillingSession(c *gin.Context, relayInfo *relaycommon.RelayInfo, preConsumedQuota int) (*BillingSession, *types.NewAPIError) {
 	if relayInfo == nil {
 		return nil, types.NewError(fmt.Errorf("relayInfo is nil"), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
+	}
+
+	if common.GetContextKeyString(c, constant.ContextKeyTokenManagedBy) == model.CaoliaoManagedBy {
+		session := &BillingSession{
+			relayInfo: relayInfo,
+			funding:   &ManagedTokenFunding{},
+		}
+		if apiErr := session.preConsume(c, preConsumedQuota); apiErr != nil {
+			return nil, apiErr
+		}
+		return session, nil
 	}
 
 	pref := common.NormalizeBillingPreference(relayInfo.UserSetting.BillingPreference)

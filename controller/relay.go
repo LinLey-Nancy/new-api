@@ -91,7 +91,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 	defer func() {
 		if newAPIError != nil {
-			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
+			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(relayErrorForInternalUse(c, newAPIError))))
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
@@ -151,6 +151,27 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 
+	maxOutputTokens := 0
+	if meta != nil {
+		maxOutputTokens = meta.MaxTokens
+	}
+	allowed, retryAfter, err := middleware.ReserveManagedTokenTPM(c, tokens, maxOutputTokens)
+	if err != nil {
+		newAPIError = types.NewErrorWithStatusCode(err, types.ErrorCode("rate_limit_check_failed"), http.StatusInternalServerError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
+		return
+	}
+	if !allowed {
+		c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
+		newAPIError = types.NewErrorWithStatusCode(
+			fmt.Errorf("API key token limit exceeded"),
+			types.ErrorCode("rate_limit_exceeded"),
+			http.StatusTooManyRequests,
+			types.ErrOptionWithSkipRetry(),
+			types.ErrOptionWithNoRecordErrorLog(),
+		)
+		return
+	}
+
 	relayInfo.SetEstimatePromptTokens(tokens)
 
 	priceData, err := helper.ModelPriceHelper(c, relayInfo, tokens, meta)
@@ -158,10 +179,14 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = types.NewError(err, types.ErrorCodeModelPriceError, types.ErrOptionWithStatusCode(http.StatusBadRequest))
 		return
 	}
+	isManagedToken := common.GetContextKeyString(c, constant.ContextKeyTokenManagedBy) == model.CaoliaoManagedBy
+	if isManagedToken {
+		priceData.QuotaToPreConsume = middleware.ManagedTokenRequestReserve(tokens, maxOutputTokens)
+	}
 
 	// common.SetContextKey(c, constant.ContextKeyTokenCountMeta, meta)
 
-	if priceData.FreeModel {
+	if priceData.FreeModel && !isManagedToken {
 		logger.LogInfo(c, fmt.Sprintf("模型 %s 免费，跳过预扣费", relayInfo.OriginModelName))
 	} else {
 		newAPIError = service.PreConsumeBilling(c, priceData.QuotaToPreConsume, relayInfo)
@@ -361,12 +386,13 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError) {
-	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
+	internalReason := relayErrorForInternalUse(c, err)
+	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(internalReason)))
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
 	if service.ShouldDisableChannel(err) && channelError.AutoBan {
 		gopool.Go(func() {
-			service.DisableChannel(channelError, err.ErrorWithStatusCode())
+			service.DisableChannel(channelError, internalReason)
 		})
 	}
 
@@ -402,9 +428,23 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			startTime = time.Now()
 		}
 		useTimeSeconds := int(time.Since(startTime).Seconds())
-		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, err.MaskSensitiveErrorWithStatusCode(), tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
+		content := err.MaskSensitiveErrorWithStatusCode()
+		if common.GetContextKeyString(c, constant.ContextKeyTokenManagedBy) == model.CaoliaoManagedBy {
+			content = internalReason
+		}
+		model.RecordErrorLog(c, userId, channelId, modelName, tokenName, content, tokenId, useTimeSeconds, common.GetContextKeyBool(c, constant.ContextKeyIsStream), userGroup, other)
 	}
 
+}
+
+func relayErrorForInternalUse(c *gin.Context, err *types.NewAPIError) string {
+	if err == nil {
+		return ""
+	}
+	if common.GetContextKeyString(c, constant.ContextKeyTokenManagedBy) == model.CaoliaoManagedBy {
+		return fmt.Sprintf("managed upstream error: status=%d code=%s", err.StatusCode, err.GetErrorCode())
+	}
+	return err.ErrorWithStatusCode()
 }
 
 func RelayMidjourney(c *gin.Context) {

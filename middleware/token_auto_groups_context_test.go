@@ -46,3 +46,19 @@ func TestSetupContextForTokenMalformedAutoGroupsFailsClosed(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, []string{}, value)
 }
+
+func TestSetupContextForTokenCarriesCaoliaoManagedLimits(t *testing.T) {
+	ctx := newTokenAutoGroupsContext()
+	token := &model.Token{
+		Id:                81,
+		UserId:            82,
+		ManagedBy:         model.CaoliaoManagedBy,
+		RequestsPerMinute: 23,
+		TokensPerMinute:   45_678,
+	}
+
+	require.NoError(t, SetupContextForToken(ctx, token))
+	assert.Equal(t, model.CaoliaoManagedBy, common.GetContextKeyString(ctx, constant.ContextKeyTokenManagedBy))
+	assert.Equal(t, 23, common.GetContextKeyInt(ctx, constant.ContextKeyTokenRPM))
+	assert.Equal(t, 45_678, common.GetContextKeyInt(ctx, constant.ContextKeyTokenTPM))
+}
