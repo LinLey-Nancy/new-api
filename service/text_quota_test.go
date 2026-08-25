@@ -22,6 +22,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestManagedTextQuotaUsesRawPromptAndCompletionTokens(t *testing.T) {
+	summary := textQuotaSummary{
+		PromptTokens:     120,
+		CompletionTokens: 30,
+		TotalTokens:      150,
+		Quota:            9_450,
+		ModelRatio:       9,
+		GroupRatio:       7,
+		CompletionRatio:  5,
+	}
+
+	assert.Equal(t, 150, managedTextQuota(true, summary))
+	assert.Equal(t, 9_450, managedTextQuota(false, summary))
+}
+
 func TestCalculateTextQuotaSummaryUnifiedForClaudeSemantic(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()

@@ -4,7 +4,10 @@ import (
 	"math"
 	"math/rand"
 	"testing"
+	"time"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -512,6 +515,139 @@ func TestBillingSessionReserveWalletTopUpDecrementsBalance(t *testing.T) {
 	userQuota, err := model.GetUserQuota(userID, false)
 	require.NoError(t, err)
 	assert.Equal(t, 450_000, userQuota)
+}
+
+func TestManagedTokenBillingIgnoresWalletAndSettlesRawTokens(t *testing.T) {
+	truncate(t)
+	const userID, tokenID = 703, 1703
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "managed-billing", 1_000)
+	ctx, _ := gin.CreateTestContext(nil)
+	common.SetContextKey(ctx, constant.ContextKeyTokenManagedBy, model.CaoliaoManagedBy)
+	ctx.Set("token_quota", 1_000)
+	relayInfo := &relaycommon.RelayInfo{
+		UserId: userID, TokenId: tokenID, TokenKey: "managed-billing", UserQuota: 0,
+		PriceData: types.PriceData{
+			ModelRatio: 9, GroupRatioInfo: types.GroupRatioInfo{GroupRatio: 7}, CompletionRatio: 5,
+		},
+	}
+	session, apiErr := NewBillingSession(ctx, relayInfo, 100)
+	require.Nil(t, apiErr)
+	require.Equal(t, BillingSourceManagedToken, relayInfo.BillingSource)
+	require.NoError(t, session.Settle(150))
+	userQuota, err := model.GetUserQuota(userID, false)
+	require.NoError(t, err)
+	assert.Zero(t, userQuota)
+	token, err := model.GetTokenById(tokenID)
+	require.NoError(t, err)
+	assert.Equal(t, 850, token.RemainQuota)
+	assert.Equal(t, 150, token.UsedQuota)
+}
+
+func TestManagedTokenBillingRejectsInsufficientFiniteQuotaBeforeWallet(t *testing.T) {
+	truncate(t)
+	const userID, tokenID = 706, 1706
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "managed-insufficient", 100)
+	ctx, _ := gin.CreateTestContext(nil)
+	common.SetContextKey(ctx, constant.ContextKeyTokenManagedBy, model.CaoliaoManagedBy)
+	ctx.Set("token_quota", 100)
+	relayInfo := &relaycommon.RelayInfo{UserId: userID, TokenId: tokenID, TokenKey: "managed-insufficient"}
+
+	_, apiErr := NewBillingSession(ctx, relayInfo, 101)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, "pre_consume_token_quota_failed", string(apiErr.GetErrorCode()))
+	userQuota, err := model.GetUserQuota(userID, false)
+	require.NoError(t, err)
+	assert.Zero(t, userQuota)
+	token, err := model.GetTokenById(tokenID)
+	require.NoError(t, err)
+	assert.Equal(t, 100, token.RemainQuota)
+	assert.Zero(t, token.UsedQuota)
+}
+
+func TestManagedUnlimitedTokenBillingTracksUsageWithoutWallet(t *testing.T) {
+	truncate(t)
+	const userID, tokenID = 707, 1707
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "managed-unlimited", 0)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", tokenID).Update("unlimited_quota", true).Error)
+	ctx, _ := gin.CreateTestContext(nil)
+	common.SetContextKey(ctx, constant.ContextKeyTokenManagedBy, model.CaoliaoManagedBy)
+	relayInfo := &relaycommon.RelayInfo{
+		UserId: userID, TokenId: tokenID, TokenKey: "managed-unlimited", TokenUnlimited: true,
+	}
+
+	session, apiErr := NewBillingSession(ctx, relayInfo, 100)
+	require.Nil(t, apiErr)
+	require.NoError(t, session.Settle(150))
+	userQuota, err := model.GetUserQuota(userID, false)
+	require.NoError(t, err)
+	assert.Zero(t, userQuota)
+	token, err := model.GetTokenById(tokenID)
+	require.NoError(t, err)
+	assert.True(t, token.UnlimitedQuota)
+	assert.Equal(t, -150, token.RemainQuota)
+	assert.Equal(t, 150, token.UsedQuota)
+}
+
+func TestManagedTokenSettlementDeltaCannotOverdrawFiniteQuota(t *testing.T) {
+	truncate(t)
+	const userID, tokenID = 708, 1708
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "managed-settlement-limit", 120)
+	ctx, _ := gin.CreateTestContext(nil)
+	common.SetContextKey(ctx, constant.ContextKeyTokenManagedBy, model.CaoliaoManagedBy)
+	ctx.Set("token_quota", 120)
+	relayInfo := &relaycommon.RelayInfo{UserId: userID, TokenId: tokenID, TokenKey: "managed-settlement-limit"}
+
+	session, apiErr := NewBillingSession(ctx, relayInfo, 100)
+	require.Nil(t, apiErr)
+	settleErr := session.Settle(150)
+	require.Error(t, settleErr)
+	assert.Contains(t, settleErr.Error(), "managed token quota is not enough")
+	token, err := model.GetTokenById(tokenID)
+	require.NoError(t, err)
+	assert.Equal(t, 20, token.RemainQuota)
+	assert.Equal(t, 100, token.UsedQuota)
+}
+
+func TestRegularWalletBillingStillRejectsZeroBalance(t *testing.T) {
+	truncate(t)
+	const userID, tokenID = 704, 1704
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "regular-billing", 1_000)
+	ctx, _ := gin.CreateTestContext(nil)
+	relayInfo := &relaycommon.RelayInfo{UserId: userID, TokenId: tokenID, TokenKey: "regular-billing"}
+	_, apiErr := NewBillingSession(ctx, relayInfo, 100)
+	require.NotNil(t, apiErr)
+	assert.Equal(t, "insufficient_user_quota", string(apiErr.GetErrorCode()))
+	token, err := model.GetTokenById(tokenID)
+	require.NoError(t, err)
+	assert.Equal(t, 1_000, token.RemainQuota)
+}
+
+func TestManagedTokenBillingRefundRestoresTokenOnly(t *testing.T) {
+	truncate(t)
+	const userID, tokenID = 705, 1705
+	seedUser(t, userID, 0)
+	seedToken(t, tokenID, userID, "managed-refund", 1_000)
+	ctx, _ := gin.CreateTestContext(nil)
+	common.SetContextKey(ctx, constant.ContextKeyTokenManagedBy, model.CaoliaoManagedBy)
+	ctx.Set("token_quota", 1_000)
+	relayInfo := &relaycommon.RelayInfo{UserId: userID, TokenId: tokenID, TokenKey: "managed-refund"}
+	session, apiErr := NewBillingSession(ctx, relayInfo, 120)
+	require.Nil(t, apiErr)
+	require.NoError(t, session.Reserve(200))
+	require.True(t, session.NeedsRefund())
+	session.Refund(ctx)
+	require.Eventually(t, func() bool {
+		token, err := model.GetTokenById(tokenID)
+		return err == nil && token.RemainQuota == 1_000 && token.UsedQuota == 0
+	}, time.Second, 10*time.Millisecond)
+	userQuota, err := model.GetUserQuota(userID, false)
+	require.NoError(t, err)
+	assert.Zero(t, userQuota)
 }
 
 func TestTryTieredSettleUsesFinalGroupAfterRetry(t *testing.T) {

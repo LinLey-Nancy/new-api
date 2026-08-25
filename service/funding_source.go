@@ -23,6 +23,17 @@ type FundingSource interface {
 	Refund() error
 }
 
+// ManagedTokenFunding uses the API token itself as the only quota source.
+// Token reservation and reconciliation remain owned by BillingSession; these
+// no-op methods deliberately avoid reading or mutating the backing user's
+// wallet or subscription quota.
+type ManagedTokenFunding struct{}
+
+func (*ManagedTokenFunding) Source() string       { return BillingSourceManagedToken }
+func (*ManagedTokenFunding) PreConsume(int) error { return nil }
+func (*ManagedTokenFunding) Settle(int) error     { return nil }
+func (*ManagedTokenFunding) Refund() error        { return nil }
+
 // ---------------------------------------------------------------------------
 // WalletFunding — 钱包资金来源实现
 // ---------------------------------------------------------------------------

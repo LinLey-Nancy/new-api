@@ -76,6 +76,13 @@ func (s *textQuotaSummary) hasBillableUsage() bool {
 	return s.TotalTokens > 0 || !s.ToolCallSurchargeQuota.IsZero()
 }
 
+func managedTextQuota(managed bool, summary textQuotaSummary) int {
+	if managed {
+		return summary.TotalTokens
+	}
+	return summary.Quota
+}
+
 func cacheWriteTokensTotal(summary textQuotaSummary) int {
 	if summary.CacheCreationTokens5m > 0 || summary.CacheCreationTokens1h > 0 {
 		splitCacheWriteTokens := summary.CacheCreationTokens5m + summary.CacheCreationTokens1h
@@ -403,6 +410,7 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	if originUsage != nil {
 		ObserveChannelAffinityUsageCacheByRelayFormat(ctx, billingUsage, relayInfo.GetFinalRequestRelayFormat())
 	}
+	isManagedToken := common.GetContextKeyString(ctx, constant.ContextKeyTokenManagedBy) == model.CaoliaoManagedBy
 
 	adminRejectReason := common.GetContextKeyString(ctx, constant.ContextKeyAdminRejectReason)
 	summary := calculateTextQuotaSummary(ctx, relayInfo, billingUsage)
@@ -420,6 +428,11 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 			tieredResult = tieredRes
 			summary.Quota = composeTieredTextQuota(relayInfo, summary, tieredQuota, tieredRes)
 		}
+	}
+	if isManagedToken {
+		summary.Quota = managedTextQuota(true, summary)
+		tieredBillingApplied = false
+		tieredResult = nil
 	}
 
 	for _, item := range summary.ToolSurchargeItems {
