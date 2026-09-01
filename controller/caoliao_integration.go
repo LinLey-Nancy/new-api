@@ -20,6 +20,8 @@ const (
 	maxCaoliaoUsageRange     = 366 * 24 * time.Hour
 )
 
+var caoliaoUsageLocation = time.FixedZone("Asia/Shanghai", 8*60*60)
+
 type caoliaoEmployeeRequest struct {
 	Name       string `json:"name"`
 	Department string `json:"department"`
@@ -334,24 +336,13 @@ func GetCaoliaoUsage(c *gin.Context) {
 		return
 	}
 
-	if rawTokenID := strings.TrimSpace(c.Query("token_id")); rawTokenID != "" {
-		tokenID, parseErr := strconv.Atoi(rawTokenID)
-		if parseErr != nil || tokenID <= 0 {
-			caoliaoError(c, http.StatusBadRequest, "invalid token_id")
-			return
-		}
-		filtered := make([]*model.Token, 0, 1)
-		for _, token := range tokens {
-			if token.Id == tokenID {
-				filtered = append(filtered, token)
-				break
-			}
-		}
-		if len(filtered) == 0 {
-			caoliaoError(c, http.StatusNotFound, "key not found")
-			return
-		}
-		tokens = filtered
+	tokens, ok = filterCaoliaoUsageTokens(c, tokens)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(c.Query("view")) == "trend" {
+		getCaoliaoTrendUsage(c, tokens, startAt, endAt)
+		return
 	}
 
 	tokenIDs := make([]int, 0, len(tokens))
@@ -555,7 +546,7 @@ func parseCaoliaoUsageTime(value string, endOfDay bool) (int64, error) {
 	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
 		return parsed.Unix(), nil
 	}
-	parsed, err := time.ParseInLocation("2006-01-02", value, time.Local)
+	parsed, err := time.ParseInLocation("2006-01-02", value, caoliaoUsageLocation)
 	if err != nil {
 		return 0, err
 	}

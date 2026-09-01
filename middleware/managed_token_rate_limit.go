@@ -146,6 +146,12 @@ func EnforceManagedTokenRPM(c *gin.Context) bool {
 	if common.GetContextKeyString(c, constant.ContextKeyTokenManagedBy) != caoliaoManagedBy {
 		return true
 	}
+	if common.GetContextKeyString(c, constant.ContextKeyOriginalModel) == "" {
+		modelRequest, _, err := getModelRequest(c)
+		if err == nil && modelRequest != nil && strings.TrimSpace(modelRequest.Model) != "" {
+			common.SetContextKey(c, constant.ContextKeyOriginalModel, modelRequest.Model)
+		}
+	}
 	limit := common.GetContextKeyInt(c, constant.ContextKeyTokenRPM)
 	allowed, retryAfter, err := takeManagedTokenLimit(c.Request.Context(), managedTokenLimitKey(c, "rpm"), limit, 1)
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
@@ -111,7 +112,9 @@ func TestEnforceManagedTokenRPMReturnsOpenAI429(t *testing.T) {
 	newContext := func() (*gin.Context, *httptest.ResponseRecorder) {
 		recorder := httptest.NewRecorder()
 		ctx, _ := gin.CreateTestContext(recorder)
-		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+			strings.NewReader(`{"model":"deepseek-v4-flash"}`))
+		ctx.Request.Header.Set("Content-Type", "application/json")
 		common.SetContextKey(ctx, constant.ContextKeyTokenManagedBy, model.CaoliaoManagedBy)
 		common.SetContextKey(ctx, constant.ContextKeyTokenId, 101)
 		common.SetContextKey(ctx, constant.ContextKeyTokenRPM, 1)
@@ -125,6 +128,8 @@ func TestEnforceManagedTokenRPMReturnsOpenAI429(t *testing.T) {
 	assert.Equal(t, http.StatusTooManyRequests, secondRecorder.Code)
 	assert.NotEmpty(t, secondRecorder.Header().Get("Retry-After"))
 	assert.Contains(t, secondRecorder.Body.String(), `"code":"rate_limit_exceeded"`)
+	assert.Equal(t, "deepseek-v4-flash",
+		common.GetContextKeyString(second, constant.ContextKeyOriginalModel))
 
 	ordinaryRecorder := httptest.NewRecorder()
 	ordinary, _ := gin.CreateTestContext(ordinaryRecorder)
