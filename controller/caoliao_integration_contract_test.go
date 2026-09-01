@@ -35,11 +35,16 @@ func TestCaoliaoKeySecretIsReturnedOnlyOnCreate(t *testing.T) {
 	require.NoError(t, err)
 	require.NotZero(t, employee.Id)
 
-	createBody := `{"name":"?? Key","token_quota":10000,"requests_per_minute":20,"tokens_per_minute":5000,"expires_at":` + strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10) + `}`
+	createBody := `{"name":"?? Key","token_quota":10000,"requests_per_two_hours":2400,"tokens_per_two_hours":600000,"daily_token_quota":7200000,"expires_at":` + strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10) + `}`
 	createResponse := caoliaoContractRequest(http.MethodPost, "/employees/E-001/keys", createBody)
 	assert.Equal(t, http.StatusOK, createResponse.Code)
 	assert.Contains(t, createResponse.Body.String(), `"secret":"sk-`)
 	assert.Contains(t, createResponse.Body.String(), `"key_mask":"sk-`)
+	assert.Contains(t, createResponse.Body.String(), `"requests_per_two_hours":2400`)
+	assert.Contains(t, createResponse.Body.String(), `"tokens_per_two_hours":600000`)
+	assert.Contains(t, createResponse.Body.String(), `"daily_token_quota":7200000`)
+	assert.NotContains(t, createResponse.Body.String(), `"requests_per_minute"`)
+	assert.NotContains(t, createResponse.Body.String(), `"tokens_per_minute"`)
 
 	listResponse := caoliaoContractRequest(http.MethodGet, "/employees/E-001/keys", "")
 	assert.Equal(t, http.StatusOK, listResponse.Code)
@@ -79,6 +84,11 @@ func TestCaoliaoTokenQuotaMinusOneMapsToUnlimitedQuota(t *testing.T) {
 		`{"name":"Unlimited Key","token_quota":-1,"requests_per_minute":20,"tokens_per_minute":5000,"expires_at":`+expiresAt+`}`)
 	require.Equal(t, http.StatusOK, createResponse.Code)
 	assert.Contains(t, createResponse.Body.String(), `"token_quota":-1`)
+	assert.Contains(t, createResponse.Body.String(), `"requests_per_two_hours":7200`)
+	assert.Contains(t, createResponse.Body.String(), `"tokens_per_two_hours":12000000`)
+	assert.Contains(t, createResponse.Body.String(), `"daily_token_quota":144000000`)
+	assert.NotContains(t, createResponse.Body.String(), `"requests_per_minute"`)
+	assert.NotContains(t, createResponse.Body.String(), `"tokens_per_minute"`)
 
 	var token model.Token
 	require.NoError(t, db.Where("managed_by = ?", model.CaoliaoManagedBy).First(&token).Error)

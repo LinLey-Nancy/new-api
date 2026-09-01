@@ -15,8 +15,6 @@ import (
 
 const (
 	defaultCaoliaoTokenQuota = -1
-	defaultCaoliaoRPM        = 60
-	defaultCaoliaoTPM        = 100_000
 	maxCaoliaoUsageRange     = 366 * 24 * time.Hour
 )
 
@@ -28,34 +26,37 @@ type caoliaoEmployeeRequest struct {
 }
 
 type caoliaoCreateKeyRequest struct {
-	Name              string `json:"name"`
-	TokenQuota        *int   `json:"token_quota"`
-	RequestsPerMinute *int   `json:"requests_per_minute"`
-	TokensPerMinute   *int   `json:"tokens_per_minute"`
-	ExpiresAt         *int64 `json:"expires_at"`
+	Name                string `json:"name"`
+	TokenQuota          *int   `json:"token_quota"`
+	RequestsPerTwoHours *int   `json:"requests_per_two_hours"`
+	TokensPerTwoHours   *int   `json:"tokens_per_two_hours"`
+	DailyTokenQuota     *int   `json:"daily_token_quota"`
+	ExpiresAt           *int64 `json:"expires_at"`
 }
 
 type caoliaoUpdateKeyRequest struct {
-	Name              *string `json:"name"`
-	TokenQuota        *int    `json:"token_quota"`
-	RequestsPerMinute *int    `json:"requests_per_minute"`
-	TokensPerMinute   *int    `json:"tokens_per_minute"`
-	ExpiresAt         *int64  `json:"expires_at"`
-	Status            *string `json:"status"`
+	Name                *string `json:"name"`
+	TokenQuota          *int    `json:"token_quota"`
+	RequestsPerTwoHours *int    `json:"requests_per_two_hours"`
+	TokensPerTwoHours   *int    `json:"tokens_per_two_hours"`
+	DailyTokenQuota     *int    `json:"daily_token_quota"`
+	ExpiresAt           *int64  `json:"expires_at"`
+	Status              *string `json:"status"`
 }
 
 type caoliaoKeyMetadata struct {
-	Id                int    `json:"id"`
-	Name              string `json:"name"`
-	KeyMask           string `json:"key_mask"`
-	Status            string `json:"status"`
-	TokenQuota        int64  `json:"token_quota"`
-	UsedQuota         int    `json:"used_quota"`
-	RequestsPerMinute int    `json:"requests_per_minute"`
-	TokensPerMinute   int    `json:"tokens_per_minute"`
-	ExpiresAt         int64  `json:"expires_at"`
-	CreatedAt         int64  `json:"created_at"`
-	LastUsedAt        int64  `json:"last_used_at"`
+	Id                  int    `json:"id"`
+	Name                string `json:"name"`
+	KeyMask             string `json:"key_mask"`
+	Status              string `json:"status"`
+	TokenQuota          int64  `json:"token_quota"`
+	UsedQuota           int    `json:"used_quota"`
+	RequestsPerTwoHours int    `json:"requests_per_two_hours"`
+	TokensPerTwoHours   int    `json:"tokens_per_two_hours"`
+	DailyTokenQuota     int    `json:"daily_token_quota"`
+	ExpiresAt           int64  `json:"expires_at"`
+	CreatedAt           int64  `json:"created_at"`
+	LastUsedAt          int64  `json:"last_used_at"`
 }
 
 type caoliaoUsageMetrics struct {
@@ -173,24 +174,28 @@ func PostCaoliaoEmployeeKey(c *gin.Context) {
 	if request.TokenQuota != nil {
 		quota = *request.TokenQuota
 	}
-	rpm := defaultCaoliaoRPM
-	if request.RequestsPerMinute != nil {
-		rpm = *request.RequestsPerMinute
+	requestsPerTwoHours := model.DefaultCaoliaoRequestsPerTwoHours
+	if request.RequestsPerTwoHours != nil {
+		requestsPerTwoHours = *request.RequestsPerTwoHours
 	}
-	tpm := defaultCaoliaoTPM
-	if request.TokensPerMinute != nil {
-		tpm = *request.TokensPerMinute
+	tokensPerTwoHours := model.DefaultCaoliaoOutputTokensPerTwoHours
+	if request.TokensPerTwoHours != nil {
+		tokensPerTwoHours = *request.TokensPerTwoHours
+	}
+	dailyTokenQuota := model.DefaultCaoliaoDailyOutputTokenQuota
+	if request.DailyTokenQuota != nil {
+		dailyTokenQuota = *request.DailyTokenQuota
 	}
 	expiresAt := time.Now().Add(365 * 24 * time.Hour).Unix()
 	if request.ExpiresAt != nil {
 		expiresAt = *request.ExpiresAt
 	}
-	if message := validateCaoliaoKeyLimits(quota, rpm, tpm, expiresAt); message != "" {
+	if message := validateCaoliaoKeyLimits(quota, requestsPerTwoHours, tokensPerTwoHours, dailyTokenQuota, expiresAt); message != "" {
 		caoliaoError(c, http.StatusBadRequest, message)
 		return
 	}
 
-	token, secret, err := model.CreateCaoliaoToken(user.Id, request.Name, quota, rpm, tpm, expiresAt)
+	token, secret, err := model.CreateCaoliaoToken(user.Id, request.Name, quota, requestsPerTwoHours, tokensPerTwoHours, dailyTokenQuota, expiresAt)
 	if err != nil {
 		caoliaoInternalError(c, err)
 		return
@@ -211,7 +216,7 @@ func PatchCaoliaoKey(c *gin.Context) {
 		caoliaoError(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if request.Name == nil && request.TokenQuota == nil && request.RequestsPerMinute == nil && request.TokensPerMinute == nil && request.ExpiresAt == nil && request.Status == nil {
+	if request.Name == nil && request.TokenQuota == nil && request.RequestsPerTwoHours == nil && request.TokensPerTwoHours == nil && request.DailyTokenQuota == nil && request.ExpiresAt == nil && request.Status == nil {
 		caoliaoError(c, http.StatusBadRequest, "at least one field must be provided")
 		return
 	}
@@ -246,19 +251,29 @@ func PatchCaoliaoKey(c *gin.Context) {
 			}
 		}
 	}
-	if request.RequestsPerMinute != nil {
-		if *request.RequestsPerMinute < 0 || *request.RequestsPerMinute > common.MaxQuota {
-			caoliaoError(c, http.StatusBadRequest, "requests_per_minute is out of range")
+	requestsPerTwoHours := request.RequestsPerTwoHours
+	if requestsPerTwoHours != nil {
+		if *requestsPerTwoHours < 0 || *requestsPerTwoHours > common.MaxQuota {
+			caoliaoError(c, http.StatusBadRequest, "requests_per_two_hours is out of range")
 			return
 		}
-		token.RequestsPerMinute = *request.RequestsPerMinute
+		token.RequestsPerTwoHours = *requestsPerTwoHours
 	}
-	if request.TokensPerMinute != nil {
-		if *request.TokensPerMinute < 0 || *request.TokensPerMinute > common.MaxQuota {
-			caoliaoError(c, http.StatusBadRequest, "tokens_per_minute is out of range")
+	tokensPerTwoHours := request.TokensPerTwoHours
+	if tokensPerTwoHours != nil {
+		if *tokensPerTwoHours < 0 || *tokensPerTwoHours > common.MaxQuota {
+			caoliaoError(c, http.StatusBadRequest, "tokens_per_two_hours is out of range")
 			return
 		}
-		token.TokensPerMinute = *request.TokensPerMinute
+		token.TokensPerTwoHours = *tokensPerTwoHours
+	}
+	dailyTokenQuota := request.DailyTokenQuota
+	if dailyTokenQuota != nil {
+		if *dailyTokenQuota < 0 || *dailyTokenQuota > common.MaxQuota {
+			caoliaoError(c, http.StatusBadRequest, "daily_token_quota is out of range")
+			return
+		}
+		token.DailyTokenQuota = *dailyTokenQuota
 	}
 	if request.ExpiresAt != nil {
 		if *request.ExpiresAt != -1 && *request.ExpiresAt <= common.GetTimestamp() {
@@ -422,17 +437,18 @@ func buildCaoliaoKeyMetadata(token *model.Token) caoliaoKeyMetadata {
 		totalQuota = -1
 	}
 	return caoliaoKeyMetadata{
-		Id:                token.Id,
-		Name:              token.Name,
-		KeyMask:           "sk-" + token.GetMaskedKey(),
-		Status:            caoliaoTokenStatus(token),
-		TokenQuota:        totalQuota,
-		UsedQuota:         token.UsedQuota,
-		RequestsPerMinute: token.RequestsPerMinute,
-		TokensPerMinute:   token.TokensPerMinute,
-		ExpiresAt:         token.ExpiredTime,
-		CreatedAt:         token.CreatedTime,
-		LastUsedAt:        lastUsedAt,
+		Id:                  token.Id,
+		Name:                token.Name,
+		KeyMask:             "sk-" + token.GetMaskedKey(),
+		Status:              caoliaoTokenStatus(token),
+		TokenQuota:          totalQuota,
+		UsedQuota:           token.UsedQuota,
+		RequestsPerTwoHours: token.RequestsPerTwoHours,
+		TokensPerTwoHours:   token.TokensPerTwoHours,
+		DailyTokenQuota:     token.DailyTokenQuota,
+		ExpiresAt:           token.ExpiredTime,
+		CreatedAt:           token.CreatedTime,
+		LastUsedAt:          lastUsedAt,
 	}
 }
 
@@ -453,15 +469,18 @@ func caoliaoTokenStatus(token *model.Token) string {
 	}
 }
 
-func validateCaoliaoKeyLimits(quota int, rpm int, tpm int, expiresAt int64) string {
+func validateCaoliaoKeyLimits(quota int, requestsPerTwoHours int, tokensPerTwoHours int, dailyTokenQuota int, expiresAt int64) string {
 	if quota != -1 && (quota <= 0 || quota > common.MaxQuota) {
 		return "token_quota is out of range"
 	}
-	if rpm < 0 || rpm > common.MaxQuota {
-		return "requests_per_minute is out of range"
+	if requestsPerTwoHours < 0 || requestsPerTwoHours > common.MaxQuota {
+		return "requests_per_two_hours is out of range"
 	}
-	if tpm < 0 || tpm > common.MaxQuota {
-		return "tokens_per_minute is out of range"
+	if tokensPerTwoHours < 0 || tokensPerTwoHours > common.MaxQuota {
+		return "tokens_per_two_hours is out of range"
+	}
+	if dailyTokenQuota < 0 || dailyTokenQuota > common.MaxQuota {
+		return "daily_token_quota is out of range"
 	}
 	if expiresAt != -1 && expiresAt <= common.GetTimestamp() {
 		return "expires_at must be in the future or -1"

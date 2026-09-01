@@ -78,7 +78,7 @@ func (s *textQuotaSummary) hasBillableUsage() bool {
 
 func managedTextQuota(managed bool, summary textQuotaSummary) int {
 	if managed {
-		return summary.TotalTokens
+		return summary.CompletionTokens
 	}
 	return summary.Quota
 }
@@ -461,6 +461,7 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, summary.Quota)
 	}
 
+	common.SetContextKey(ctx, constant.ContextKeyManagedOutputTokens, summary.CompletionTokens)
 	if err := SettleBilling(ctx, relayInfo, summary.Quota); err != nil {
 		logger.LogError(ctx, "error settling billing: "+err.Error())
 	}

@@ -22,7 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestManagedTextQuotaUsesRawPromptAndCompletionTokens(t *testing.T) {
+func TestManagedTextQuotaUsesOnlyRawCompletionTokens(t *testing.T) {
 	summary := textQuotaSummary{
 		PromptTokens:     120,
 		CompletionTokens: 30,
@@ -33,7 +33,7 @@ func TestManagedTextQuotaUsesRawPromptAndCompletionTokens(t *testing.T) {
 		CompletionRatio:  5,
 	}
 
-	assert.Equal(t, 150, managedTextQuota(true, summary))
+	assert.Equal(t, 30, managedTextQuota(true, summary))
 	assert.Equal(t, 9_450, managedTextQuota(false, summary))
 }
 

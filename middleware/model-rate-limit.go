@@ -167,7 +167,7 @@ func memoryRateLimitHandler(duration int64, totalMaxCount, successMaxCount int) 
 // ModelRequestRateLimit 模型请求限流中间件
 func ModelRequestRateLimit() func(c *gin.Context) {
 	return func(c *gin.Context) {
-		if !EnforceManagedTokenRPM(c) {
+		if !EnforceManagedTokenRequestLimit(c) {
 			return
 		}
 

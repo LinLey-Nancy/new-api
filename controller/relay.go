@@ -155,7 +155,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if meta != nil {
 		maxOutputTokens = meta.MaxTokens
 	}
-	allowed, retryAfter, err := middleware.ReserveManagedTokenTPM(c, tokens, maxOutputTokens)
+	allowed, retryAfter, err := middleware.ReserveManagedOutputTokenLimits(c, maxOutputTokens)
 	if err != nil {
 		newAPIError = types.NewErrorWithStatusCode(err, types.ErrorCode("rate_limit_check_failed"), http.StatusInternalServerError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		return
@@ -171,6 +171,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		)
 		return
 	}
+	defer service.CancelManagedUsageReservation(c)
 
 	relayInfo.SetEstimatePromptTokens(tokens)
 
@@ -181,7 +182,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	isManagedToken := common.GetContextKeyString(c, constant.ContextKeyTokenManagedBy) == model.CaoliaoManagedBy
 	if isManagedToken {
-		priceData.QuotaToPreConsume = middleware.ManagedTokenRequestReserve(tokens, maxOutputTokens)
+		priceData.QuotaToPreConsume = middleware.ManagedOutputTokenRequestReserve(maxOutputTokens)
 	}
 
 	// common.SetContextKey(c, constant.ContextKeyTokenCountMeta, meta)

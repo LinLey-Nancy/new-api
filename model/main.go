@@ -296,6 +296,9 @@ func migrateDB() error {
 	if err != nil {
 		return err
 	}
+	if err := migrateCaoliaoManagedTokenLimits(); err != nil {
+		return err
+	}
 	if err := InitializeUserAuthVersions(); err != nil {
 		return err
 	}
@@ -377,6 +380,9 @@ func migrateDBFast() error {
 			return err
 		}
 	}
+	if err := migrateCaoliaoManagedTokenLimits(); err != nil {
+		return err
+	}
 	if err := InitializeUserAuthVersions(); err != nil {
 		return err
 	}
@@ -394,6 +400,30 @@ func migrateDBFast() error {
 	}
 	common.SysLog("database migrated")
 	return nil
+}
+
+// migrateCaoliaoManagedTokenLimits clears every removed per-minute setting and
+// assigns the same initial two-hour/daily defaults to existing managed keys.
+// Lifetime token quotas and their used/remaining values are deliberately not
+// touched. The version marker makes the migration idempotent.
+func migrateCaoliaoManagedTokenLimits() error {
+	if !DB.Migrator().HasColumn(&Token{}, "managed_limit_version") {
+		return nil
+	}
+	query := DB.Table("tokens").Where("managed_by = ? AND managed_limit_version = 0", CaoliaoManagedBy)
+	updates := map[string]interface{}{
+		"requests_per_two_hours": DefaultCaoliaoRequestsPerTwoHours,
+		"tokens_per_two_hours":   DefaultCaoliaoOutputTokensPerTwoHours,
+		"daily_token_quota":      DefaultCaoliaoDailyOutputTokenQuota,
+		"managed_limit_version":  1,
+	}
+	if DB.Migrator().HasColumn("tokens", "requests_per_minute") {
+		updates["requests_per_minute"] = 0
+	}
+	if DB.Migrator().HasColumn("tokens", "tokens_per_minute") {
+		updates["tokens_per_minute"] = 0
+	}
+	return query.Updates(updates).Error
 }
 
 func migrateLOGDB() error {
