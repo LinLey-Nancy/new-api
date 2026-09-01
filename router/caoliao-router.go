@@ -17,5 +17,6 @@ func registerCaoliaoRoutes(apiRouter *gin.RouterGroup) {
 		caoliaoRoute.PATCH("/keys/:id", controller.PatchCaoliaoKey)
 		caoliaoRoute.DELETE("/keys/:id", controller.DeleteCaoliaoKey)
 		caoliaoRoute.GET("/usage", controller.GetCaoliaoUsage)
+		caoliaoRoute.POST("/usage/mock", controller.PostCaoliaoMockUsage)
 	}
 }

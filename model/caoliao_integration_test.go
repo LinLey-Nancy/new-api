@@ -2,6 +2,7 @@ package model
 
 import (
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/glebarez/sqlite"
@@ -34,6 +35,58 @@ func TestTokenCacheRoundTripsCaoliaoManagedLimits(t *testing.T) {
 	assert.Equal(t, 37, cached.RequestsPerMinute)
 	assert.Equal(t, 12_345, cached.TokensPerMinute)
 	assert.True(t, cached.UnlimitedQuota)
+}
+
+func TestQueryCaoliaoDailyUsageGroupsByShanghaiDayAndModel(t *testing.T) {
+	previousDB, previousLogDB := DB, LOG_DB
+	db, err := gorm.Open(sqlite.Open("file:caoliao-daily-main-test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	logDB, err := gorm.Open(sqlite.Open("file:caoliao-daily-log-test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, logDB.AutoMigrate(&Log{}))
+	DB, LOG_DB = db, logDB
+	t.Cleanup(func() { DB, LOG_DB = previousDB, previousLogDB })
+
+	lateUTC := time.Date(2026, 8, 1, 16, 30, 0, 0, time.UTC).Unix()
+	logs := []Log{
+		{TokenId: 7, CreatedAt: lateUTC, Type: LogTypeConsume, ModelName: "deepseek-v4-flash", PromptTokens: 100, CompletionTokens: 20, Quota: 120},
+		{TokenId: 8, CreatedAt: lateUTC + 10, Type: LogTypeError, ModelName: "deepseek-v4-flash", Content: "upstream error"},
+		{TokenId: 7, CreatedAt: lateUTC + 20, Type: LogTypeConsume, ModelName: "qwen3.6", PromptTokens: 50, CompletionTokens: 10, Quota: 60},
+		{TokenId: 9, CreatedAt: lateUTC + 30, Type: LogTypeConsume, ModelName: "deepseek-v4-flash", PromptTokens: 999, CompletionTokens: 999, Quota: 1998},
+	}
+	require.NoError(t, logDB.Create(&logs).Error)
+
+	usage, err := QueryCaoliaoDailyUsage([]int{7, 8}, []string{"deepseek-v4-flash", "qwen3.6"}, lateUTC-60, lateUTC+60)
+	require.NoError(t, err)
+	require.Len(t, usage, 2)
+	assert.Equal(t, "2026-08-02", usage[0].UsageDay)
+	assert.Equal(t, "deepseek-v4-flash", usage[0].ModelName)
+	assert.EqualValues(t, 1, usage[0].SuccessfulRequests)
+	assert.EqualValues(t, 1, usage[0].FailedRequests)
+	assert.EqualValues(t, 100, usage[0].InputTokens)
+	assert.EqualValues(t, 20, usage[0].OutputTokens)
+	assert.Equal(t, "qwen3.6", usage[1].ModelName)
+}
+
+func TestCaoliaoUsageDayExpressionSupportsEveryLogDatabase(t *testing.T) {
+	tests := []struct {
+		dialect  string
+		contains string
+	}{
+		{dialect: "sqlite", contains: "strftime"},
+		{dialect: "postgres", contains: "AT TIME ZONE 'Asia/Shanghai'"},
+		{dialect: "mysql", contains: "1970-01-01 08:00:00"},
+		{dialect: "clickhouse", contains: "formatDateTime"},
+	}
+	for _, test := range tests {
+		t.Run(test.dialect, func(t *testing.T) {
+			expression, err := caoliaoUsageDayExpression(test.dialect)
+			require.NoError(t, err)
+			assert.Contains(t, expression, test.contains)
+		})
+	}
+	_, err := caoliaoUsageDayExpression("unknown")
+	assert.ErrorContains(t, err, "unsupported log database dialect")
 }
 
 func TestQueryCaoliaoUsageAggregatesMetadataOnly(t *testing.T) {
