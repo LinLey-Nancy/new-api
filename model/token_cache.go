@@ -66,7 +66,7 @@ if redis.call('EXISTS', KEYS[2]) == 1 then
   return 0
 end
 if redis.call('EXISTS', KEYS[1]) == 1 then
-  redis.call('EXPIRE', KEYS[1], ARGV[20])
+  redis.call('EXPIRE', KEYS[1], ARGV[22])
   return 2
 end
 redis.call('HSET', KEYS[1],
@@ -75,8 +75,10 @@ redis.call('HSET', KEYS[1],
   'UnlimitedQuota', ARGV[8], 'ModelLimitsEnabled', ARGV[9], 'ModelLimits', ARGV[10],
   'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
   'AutoGroups', ARGV[14], 'RemainQuota', ARGV[15], 'UsedQuota', ARGV[16],
-  'ManagedBy', ARGV[17], 'RequestsPerMinute', ARGV[18], 'TokensPerMinute', ARGV[19])
-redis.call('EXPIRE', KEYS[1], ARGV[20])
+  'ManagedBy', ARGV[17], 'RequestsPerTwoHours', ARGV[18],
+  'TokensPerTwoHours', ARGV[19], 'DailyTokenQuota', ARGV[20],
+  'ManagedLimitVersion', ARGV[21])
+redis.call('EXPIRE', KEYS[1], ARGV[22])
 return 1`
 
 	return common.RDB.Eval(context.Background(), script, []string{
@@ -87,7 +89,8 @@ return 1`
 		strconv.FormatBool(token.UnlimitedQuota), strconv.FormatBool(token.ModelLimitsEnabled),
 		token.ModelLimits, allowIps, token.Group, strconv.FormatBool(token.CrossGroupRetry),
 		token.AutoGroups, token.RemainQuota, token.UsedQuota,
-		token.ManagedBy, token.RequestsPerMinute, token.TokensPerMinute,
+		token.ManagedBy, token.RequestsPerTwoHours, token.TokensPerTwoHours, token.DailyTokenQuota,
+		token.ManagedLimitVersion,
 		tokenCacheTTLSeconds(),
 	).Int()
 }
@@ -103,6 +106,9 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 	}
 	if token.Id <= 0 {
 		return nil, fmt.Errorf("token cache is incomplete")
+	}
+	if token.ManagedBy == CaoliaoManagedBy && token.ManagedLimitVersion < 1 {
+		return nil, fmt.Errorf("managed token cache uses a legacy limit schema")
 	}
 	token.Key = key
 	return &token, nil

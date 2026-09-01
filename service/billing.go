@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
@@ -50,6 +52,7 @@ func PreConsumeBilling(c *gin.Context, preConsumedQuota int, relayInfo *relaycom
 // SettleBilling 执行计费结算。如果 RelayInfo 上有 BillingSession 则通过 session 结算，
 // 否则回退到旧的 PostConsumeQuota 路径（兼容按次计费等场景）。
 func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuota int) error {
+	var billingErr error
 	if relayInfo.Billing != nil {
 		preConsumed := relayInfo.Billing.GetPreConsumedQuota()
 		delta := actualQuota - preConsumed
@@ -72,25 +75,70 @@ func SettleBilling(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, actualQuo
 			))
 		}
 
-		if err := relayInfo.Billing.Settle(actualQuota); err != nil {
-			return err
-		}
+		billingErr = relayInfo.Billing.Settle(actualQuota)
 
 		// 发送额度通知（订阅计费使用订阅剩余额度）
-		if actualQuota != 0 && relayInfo.BillingSource != BillingSourceManagedToken {
+		if billingErr == nil && actualQuota != 0 && relayInfo.BillingSource != BillingSourceManagedToken {
 			if relayInfo.BillingSource == BillingSourceSubscription {
 				checkAndSendSubscriptionQuotaNotify(relayInfo)
 			} else {
 				checkAndSendQuotaNotify(relayInfo, actualQuota-preConsumed, preConsumed)
 			}
 		}
-		return nil
+		usageErr := settleManagedUsageReservation(ctx)
+		if billingErr != nil {
+			return billingErr
+		}
+		return usageErr
 	}
 
 	// 回退：无 BillingSession 时使用旧路径
 	quotaDelta := actualQuota - relayInfo.FinalPreConsumedQuota
 	if quotaDelta != 0 {
-		return PostConsumeQuota(relayInfo, quotaDelta, relayInfo.FinalPreConsumedQuota, true)
+		billingErr = PostConsumeQuota(relayInfo, quotaDelta, relayInfo.FinalPreConsumedQuota, true)
 	}
-	return nil
+	usageErr := settleManagedUsageReservation(ctx)
+	if billingErr != nil {
+		return billingErr
+	}
+	return usageErr
+}
+
+func settleManagedUsageReservation(ctx *gin.Context) error {
+	reservation := takeManagedUsageReservation(ctx)
+	if reservation == nil {
+		return nil
+	}
+	actualOutputTokens := common.GetContextKeyInt(ctx, constant.ContextKeyManagedOutputTokens)
+	return common.ReconcileManagedTokenLimits(ctx.Request.Context(), reservation, actualOutputTokens)
+}
+
+// CancelManagedUsageReservation releases a worst-case output reservation when
+// a request exits before actual output usage can be settled. It is safe to
+// defer this on every managed request because successful settlement removes
+// the reservation from the request context first.
+func CancelManagedUsageReservation(ctx *gin.Context) {
+	reservation := takeManagedUsageReservation(ctx)
+	if reservation == nil {
+		return
+	}
+	if err := common.ReconcileManagedTokenLimits(ctx.Request.Context(), reservation, 0); err != nil {
+		common.SysLog("failed to release managed output token reservation: " + err.Error())
+	}
+}
+
+func takeManagedUsageReservation(ctx *gin.Context) *common.ManagedUsageReservation {
+	if ctx == nil {
+		return nil
+	}
+	value, exists := common.GetContextKey(ctx, constant.ContextKeyManagedUsageReservation)
+	if !exists || value == nil {
+		return nil
+	}
+	reservation, ok := value.(*common.ManagedUsageReservation)
+	if !ok || reservation == nil {
+		return nil
+	}
+	common.SetContextKey(ctx, constant.ContextKeyManagedUsageReservation, nil)
+	return reservation
 }

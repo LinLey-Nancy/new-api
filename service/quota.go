@@ -205,6 +205,9 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 	if tieredOk {
 		quota = tieredQuota
 	}
+	if common.GetContextKeyString(ctx, constant.ContextKeyTokenManagedBy) == model.CaoliaoManagedBy {
+		quota = usage.OutputTokens
+	}
 
 	totalTokens := usage.TotalTokens
 	var logContent string
@@ -228,6 +231,7 @@ func PostWssConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, mod
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 	}
 
+	common.SetContextKey(ctx, constant.ContextKeyManagedOutputTokens, usage.OutputTokens)
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
 		logger.LogError(ctx, "error settling billing: "+err.Error())
 	}
@@ -328,6 +332,9 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 	if tieredOk {
 		quota = tieredQuota
 	}
+	if common.GetContextKeyString(ctx, constant.ContextKeyTokenManagedBy) == model.CaoliaoManagedBy {
+		quota = usage.CompletionTokens
+	}
 
 	totalTokens := usage.TotalTokens
 	var logContent string
@@ -351,6 +358,7 @@ func PostAudioConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, u
 		model.UpdateChannelUsedQuota(relayInfo.ChannelId, quota)
 	}
 
+	common.SetContextKey(ctx, constant.ContextKeyManagedOutputTokens, usage.CompletionTokens)
 	if err := SettleBilling(ctx, relayInfo, quota); err != nil {
 		logger.LogError(ctx, "error settling billing: "+err.Error())
 	}

@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,99 +14,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestManagedTokenRequestReserveUsesDeclaredOrDefaultOutput(t *testing.T) {
+func TestManagedOutputTokenRequestReserveUsesOnlyDeclaredOrDefaultOutput(t *testing.T) {
 	t.Setenv("CAOLIAO_DEFAULT_MAX_OUTPUT_TOKENS", "4096")
 
-	assert.Equal(t, 600, ManagedTokenRequestReserve(100, 500))
-	assert.Equal(t, 4_196, ManagedTokenRequestReserve(100, 0))
-	assert.Equal(t, common.MaxQuota, ManagedTokenRequestReserve(common.MaxQuota-5, 10))
+	assert.Equal(t, 500, ManagedOutputTokenRequestReserve(500))
+	assert.Equal(t, 4_096, ManagedOutputTokenRequestReserve(0))
 }
 
-func resetManagedTokenWindowsForTest() {
-	managedTokenWindowMu.Lock()
-	defer managedTokenWindowMu.Unlock()
-	managedTokenWindows = make(map[string]managedTokenWindow)
-}
-
-func TestTakeManagedTokenLimitCountsRequests(t *testing.T) {
-	previousRedisEnabled := common.RedisEnabled
-	common.RedisEnabled = false
-	t.Cleanup(func() {
-		common.RedisEnabled = previousRedisEnabled
-		resetManagedTokenWindowsForTest()
-	})
-	resetManagedTokenWindowsForTest()
-
-	allowed, _, err := takeManagedTokenLimit(context.Background(), "test:rpm", 2, 1)
-	require.NoError(t, err)
-	assert.True(t, allowed)
-	allowed, _, err = takeManagedTokenLimit(context.Background(), "test:rpm", 2, 1)
-	require.NoError(t, err)
-	assert.True(t, allowed)
-	allowed, retryAfter, err := takeManagedTokenLimit(context.Background(), "test:rpm", 2, 1)
-	require.NoError(t, err)
-	assert.False(t, allowed)
-	assert.Positive(t, retryAfter)
-}
-
-func TestTakeManagedTokenLimitUsesWeightedBudget(t *testing.T) {
-	previousRedisEnabled := common.RedisEnabled
-	common.RedisEnabled = false
-	t.Cleanup(func() {
-		common.RedisEnabled = previousRedisEnabled
-		resetManagedTokenWindowsForTest()
-	})
-	resetManagedTokenWindowsForTest()
-
-	allowed, _, err := takeManagedTokenLimit(context.Background(), "test:tpm", 100, 60)
-	require.NoError(t, err)
-	assert.True(t, allowed)
-	allowed, _, err = takeManagedTokenLimit(context.Background(), "test:tpm", 100, 41)
-	require.NoError(t, err)
-	assert.False(t, allowed)
-	allowed, _, err = takeManagedTokenLimit(context.Background(), "test:tpm", 100, 40)
-	require.NoError(t, err)
-	assert.True(t, allowed)
-}
-
-func TestTakeManagedTokenLimitZeroMeansUnlimited(t *testing.T) {
+func TestEnforceManagedTokenRequestLimitReturnsOpenAI429(t *testing.T) {
 	previousRedisEnabled := common.RedisEnabled
 	common.RedisEnabled = false
 	t.Cleanup(func() { common.RedisEnabled = previousRedisEnabled })
-
-	allowed, retryAfter, err := takeManagedTokenLimit(context.Background(), "test:unlimited", 0, 1_000_000)
-	require.NoError(t, err)
-	assert.True(t, allowed)
-	assert.Zero(t, retryAfter)
-}
-
-func TestTakeManagedTokenLimitUsesRedisFixedWindow(t *testing.T) {
-	redisServer, _ := useRateLimitMiniRedis(t)
-
-	allowed, _, err := takeManagedTokenLimit(context.Background(), "test:redis:tpm", 100, 60)
-	require.NoError(t, err)
-	assert.True(t, allowed)
-	allowed, retryAfter, err := takeManagedTokenLimit(context.Background(), "test:redis:tpm", 100, 41)
-	require.NoError(t, err)
-	assert.False(t, allowed)
-	assert.EqualValues(t, 60, retryAfter)
-	stored, err := redisServer.Get("test:redis:tpm")
-	require.NoError(t, err)
-	assert.Equal(t, "60", stored)
-
-	allowed, _, err = takeManagedTokenLimit(context.Background(), "test:redis:other-token", 100, 100)
-	require.NoError(t, err)
-	assert.True(t, allowed, "different managed keys must not share a TPM counter")
-}
-
-func TestEnforceManagedTokenRPMReturnsOpenAI429(t *testing.T) {
-	previousRedisEnabled := common.RedisEnabled
-	common.RedisEnabled = false
-	resetManagedTokenWindowsForTest()
-	t.Cleanup(func() {
-		common.RedisEnabled = previousRedisEnabled
-		resetManagedTokenWindowsForTest()
-	})
 
 	newContext := func() (*gin.Context, *httptest.ResponseRecorder) {
 		recorder := httptest.NewRecorder()
@@ -116,15 +33,15 @@ func TestEnforceManagedTokenRPMReturnsOpenAI429(t *testing.T) {
 			strings.NewReader(`{"model":"deepseek-v4-flash"}`))
 		ctx.Request.Header.Set("Content-Type", "application/json")
 		common.SetContextKey(ctx, constant.ContextKeyTokenManagedBy, model.CaoliaoManagedBy)
-		common.SetContextKey(ctx, constant.ContextKeyTokenId, 101)
-		common.SetContextKey(ctx, constant.ContextKeyTokenRPM, 1)
+		common.SetContextKey(ctx, constant.ContextKeyTokenId, 9_101)
+		common.SetContextKey(ctx, constant.ContextKeyTokenRequestsPerTwoHours, 1)
 		return ctx, recorder
 	}
 
 	first, _ := newContext()
-	assert.True(t, EnforceManagedTokenRPM(first))
+	assert.True(t, EnforceManagedTokenRequestLimit(first))
 	second, secondRecorder := newContext()
-	assert.False(t, EnforceManagedTokenRPM(second))
+	assert.False(t, EnforceManagedTokenRequestLimit(second))
 	assert.Equal(t, http.StatusTooManyRequests, secondRecorder.Code)
 	assert.NotEmpty(t, secondRecorder.Header().Get("Retry-After"))
 	assert.Contains(t, secondRecorder.Body.String(), `"code":"rate_limit_exceeded"`)
@@ -134,36 +51,43 @@ func TestEnforceManagedTokenRPMReturnsOpenAI429(t *testing.T) {
 	ordinaryRecorder := httptest.NewRecorder()
 	ordinary, _ := gin.CreateTestContext(ordinaryRecorder)
 	ordinary.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-	assert.True(t, EnforceManagedTokenRPM(ordinary))
+	assert.True(t, EnforceManagedTokenRequestLimit(ordinary))
 	assert.Equal(t, http.StatusOK, ordinaryRecorder.Code)
 }
 
-func TestReserveManagedTokenTPMUsesPerKeyBudget(t *testing.T) {
+func TestReserveManagedOutputTokenLimitsUsesOutputOnlyAndPerKeyBudget(t *testing.T) {
 	previousRedisEnabled := common.RedisEnabled
 	common.RedisEnabled = false
-	resetManagedTokenWindowsForTest()
-	t.Cleanup(func() {
-		common.RedisEnabled = previousRedisEnabled
-		resetManagedTokenWindowsForTest()
-	})
+	t.Cleanup(func() { common.RedisEnabled = previousRedisEnabled })
 
 	newContext := func(tokenID int) *gin.Context {
 		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 		ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 		common.SetContextKey(ctx, constant.ContextKeyTokenManagedBy, model.CaoliaoManagedBy)
 		common.SetContextKey(ctx, constant.ContextKeyTokenId, tokenID)
-		common.SetContextKey(ctx, constant.ContextKeyTokenTPM, 100)
+		common.SetContextKey(ctx, constant.ContextKeyTokenTokensPerTwoHours, 100)
+		common.SetContextKey(ctx, constant.ContextKeyTokenDailyTokenQuota, 200)
 		return ctx
 	}
 
-	allowed, _, err := ReserveManagedTokenTPM(newContext(201), 40, 20)
+	first := newContext(9_201)
+	allowed, _, err := ReserveManagedOutputTokenLimits(first, 60)
 	require.NoError(t, err)
 	assert.True(t, allowed)
-	allowed, retryAfter, err := ReserveManagedTokenTPM(newContext(201), 21, 20)
+	value, ok := common.GetContextKey(first, constant.ContextKeyManagedUsageReservation)
+	require.True(t, ok)
+	reservation, ok := value.(*common.ManagedUsageReservation)
+	require.True(t, ok)
+	require.NoError(t, common.ReconcileManagedTokenLimits(first.Request.Context(), reservation, 20))
+
+	second := newContext(9_201)
+	allowed, retryAfter, err := ReserveManagedOutputTokenLimits(second, 81)
 	require.NoError(t, err)
-	assert.False(t, allowed)
+	assert.False(t, allowed, "20 actual output + 81 reserved output must exceed the two-hour output limit")
 	assert.Positive(t, retryAfter)
-	allowed, _, err = ReserveManagedTokenTPM(newContext(202), 80, 20)
+
+	otherKey := newContext(9_202)
+	allowed, _, err = ReserveManagedOutputTokenLimits(otherKey, 100)
 	require.NoError(t, err)
-	assert.True(t, allowed, "different managed keys must not share a TPM counter")
+	assert.True(t, allowed, "different managed keys must not share output-token counters")
 }

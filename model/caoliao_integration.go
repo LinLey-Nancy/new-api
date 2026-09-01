@@ -15,8 +15,11 @@ import (
 )
 
 const (
-	CaoliaoManagedBy      = "caoliao"
-	caoliaoEmployeePrefix = "caoliao:employee:"
+	CaoliaoManagedBy                      = "caoliao"
+	DefaultCaoliaoRequestsPerTwoHours     = 7_200
+	DefaultCaoliaoOutputTokensPerTwoHours = 12_000_000
+	DefaultCaoliaoDailyOutputTokenQuota   = 144_000_000
+	caoliaoEmployeePrefix                 = "caoliao:employee:"
 )
 
 type CaoliaoUsage struct {
@@ -146,7 +149,7 @@ func GetCaoliaoManagedToken(id int) (*Token, error) {
 	return token, err
 }
 
-func CreateCaoliaoToken(userID int, name string, quota int, requestsPerMinute int, tokensPerMinute int, expiresAt int64) (*Token, string, error) {
+func CreateCaoliaoToken(userID int, name string, quota int, requestsPerTwoHours int, tokensPerTwoHours int, dailyTokenQuota int, expiresAt int64) (*Token, string, error) {
 	rawKey, err := common.GenerateKey()
 	if err != nil {
 		return nil, "", err
@@ -157,19 +160,21 @@ func CreateCaoliaoToken(userID int, name string, quota int, requestsPerMinute in
 		remainQuota = 0
 	}
 	token := &Token{
-		UserId:            userID,
-		Key:               rawKey,
-		Status:            common.TokenStatusEnabled,
-		Name:              name,
-		CreatedTime:       common.GetTimestamp(),
-		AccessedTime:      common.GetTimestamp(),
-		ExpiredTime:       expiresAt,
-		RemainQuota:       remainQuota,
-		UnlimitedQuota:    unlimitedQuota,
-		Group:             "default",
-		ManagedBy:         CaoliaoManagedBy,
-		RequestsPerMinute: requestsPerMinute,
-		TokensPerMinute:   tokensPerMinute,
+		UserId:              userID,
+		Key:                 rawKey,
+		Status:              common.TokenStatusEnabled,
+		Name:                name,
+		CreatedTime:         common.GetTimestamp(),
+		AccessedTime:        common.GetTimestamp(),
+		ExpiredTime:         expiresAt,
+		RemainQuota:         remainQuota,
+		UnlimitedQuota:      unlimitedQuota,
+		Group:               "default",
+		ManagedBy:           CaoliaoManagedBy,
+		RequestsPerTwoHours: requestsPerTwoHours,
+		TokensPerTwoHours:   tokensPerTwoHours,
+		DailyTokenQuota:     dailyTokenQuota,
+		ManagedLimitVersion: 1,
 	}
 	if err = token.Insert(); err != nil {
 		return nil, "", err
@@ -206,14 +211,16 @@ func QueryCaoliaoUsage(tokenIDs []int, startAt int64, endAt int64) ([]CaoliaoUsa
 			COALESCE(SUM(CASE WHEN type = ? THEN completion_tokens ELSE 0 END), 0) AS output_tokens,
 			COALESCE(SUM(CASE WHEN type = ? THEN quota ELSE 0 END), 0) AS charged_tokens,
 			COALESCE(AVG(CASE WHEN type IN (?, ?) THEN use_time ELSE NULL END), 0) AS average_latency_seconds,
-			COALESCE(SUM(CASE WHEN type = ? AND content IN (?, ?) THEN 1 ELSE 0 END), 0) AS rate_limit_errors`,
+			COALESCE(SUM(CASE WHEN type = ? AND content IN (?, ?, ?, ?, ?) THEN 1 ELSE 0 END), 0) AS rate_limit_errors`,
 			LogTypeConsume,
 			LogTypeError,
 			LogTypeConsume,
 			LogTypeConsume,
 			LogTypeConsume,
 			LogTypeConsume, LogTypeError,
-			LogTypeError, "caoliao_rate_limit:rpm", "caoliao_rate_limit:tpm").
+			LogTypeError, "caoliao_rate_limit:rpm", "caoliao_rate_limit:tpm",
+			"caoliao_rate_limit:requests_2h", "caoliao_rate_limit:tokens_2h",
+			"caoliao_rate_limit:tokens_daily").
 		Where("token_id IN ?", tokenIDs).
 		Where("created_at >= ? AND created_at <= ?", startAt, endAt).
 		Where("type IN ?", []int{LogTypeConsume, LogTypeError}).
@@ -242,13 +249,15 @@ func QueryCaoliaoDailyUsage(tokenIDs []int, modelNames []string, startAt int64, 
 			COALESCE(SUM(CASE WHEN type = ? THEN prompt_tokens ELSE 0 END), 0) AS input_tokens,
 			COALESCE(SUM(CASE WHEN type = ? THEN completion_tokens ELSE 0 END), 0) AS output_tokens,
 			COALESCE(SUM(CASE WHEN type = ? THEN quota ELSE 0 END), 0) AS charged_tokens,
-			COALESCE(SUM(CASE WHEN type = ? AND content IN (?, ?) THEN 1 ELSE 0 END), 0) AS rate_limit_errors`, dayExpression),
+			COALESCE(SUM(CASE WHEN type = ? AND content IN (?, ?, ?, ?, ?) THEN 1 ELSE 0 END), 0) AS rate_limit_errors`, dayExpression),
 			LogTypeConsume,
 			LogTypeError,
 			LogTypeConsume,
 			LogTypeConsume,
 			LogTypeConsume,
-			LogTypeError, "caoliao_rate_limit:rpm", "caoliao_rate_limit:tpm").
+			LogTypeError, "caoliao_rate_limit:rpm", "caoliao_rate_limit:tpm",
+			"caoliao_rate_limit:requests_2h", "caoliao_rate_limit:tokens_2h",
+			"caoliao_rate_limit:tokens_daily").
 		Where("token_id IN ?", tokenIDs).
 		Where("model_name IN ?", modelNames).
 		Where("created_at >= ? AND created_at <= ?", startAt, endAt).
@@ -323,7 +332,7 @@ func GetCaoliaoIntegrationHealth(ctx context.Context) (int64, error) {
 // RecordCaoliaoRateLimitLog records a metadata-only error event for usage
 // aggregation. It never reads or stores request prompts or response bodies.
 func RecordCaoliaoRateLimitLog(c *gin.Context, kind string) {
-	if kind != "rpm" && kind != "tpm" {
+	if kind != "requests_2h" && kind != "tokens_2h" && kind != "tokens_daily" {
 		return
 	}
 	if common.GetContextKeyString(c, constant.ContextKeyTokenManagedBy) != CaoliaoManagedBy {

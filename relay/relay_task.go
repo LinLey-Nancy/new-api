@@ -201,6 +201,12 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 		info.PriceData.Quota = quota
 		noteTaskQuotaClamp(info, clamp)
 	}
+	managedToken := common.GetContextKeyString(c, constant.ContextKeyTokenManagedBy) == model.CaoliaoManagedBy
+	if managedToken {
+		// Media/task APIs do not report a trustworthy output-token count. They
+		// therefore consume zero from an output-token-only managed quota.
+		info.PriceData.Quota = 0
+	}
 
 	// 7. 预扣费（仅首次 — 重试时 info.Billing 已存在，跳过）
 	if info.Billing == nil && !info.PriceData.FreeModel {
@@ -249,6 +255,10 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 			info.PriceData.ReplaceOtherRatios(adjustedRatios)
 			info.PriceData.Quota = finalQuota
 		}
+	}
+	if managedToken {
+		finalQuota = 0
+		info.PriceData.Quota = 0
 	}
 
 	return &TaskSubmitResult{

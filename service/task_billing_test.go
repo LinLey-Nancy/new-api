@@ -426,6 +426,16 @@ func TestRefundTaskQuota_FundingFailureKeepsPendingMarker(t *testing.T) {
 // RecalculateTaskQuota tests
 // ===========================================================================
 
+func TestRecalculateManagedTaskDoesNotApplyNonOutputTokenCharges(t *testing.T) {
+	truncate(t)
+	task := makeTask(10, 10, 0, 10, BillingSourceManagedToken, 0)
+
+	RecalculateTaskQuota(context.Background(), task, 3_000, "upstream total tokens")
+
+	assert.Zero(t, task.Quota)
+	assert.EqualValues(t, 0, countLogs(t))
+}
+
 func TestRecalculate_PositiveDelta(t *testing.T) {
 	truncate(t)
 	ctx := context.Background()
