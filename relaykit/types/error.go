@@ -19,8 +19,9 @@ type OpenAIError struct {
 }
 
 type ClaudeError struct {
-	Type    string `json:"type,omitempty"`
-	Message string `json:"message,omitempty"`
+	Type    string    `json:"type,omitempty"`
+	Message string    `json:"message,omitempty"`
+	Code    ErrorCode `json:"code,omitempty"`
 }
 
 type ErrorType string
@@ -218,16 +219,21 @@ func (e *NewAPIError) ToClaudeError() ClaudeError {
 			result = ClaudeError{
 				Message: e.Error(),
 				Type:    fmt.Sprintf("%v", openAIError.Code),
+				Code:    e.errorCode,
 			}
 		}
 	case ErrorTypeClaudeError:
 		if claudeError, ok := e.RelayError.(ClaudeError); ok {
 			result = claudeError
+			if result.Code == "" {
+				result.Code = e.errorCode
+			}
 		}
 	default:
 		result = ClaudeError{
 			Message: e.Error(),
 			Type:    string(e.errorType),
+			Code:    e.errorCode,
 		}
 	}
 	if e.errorCode != ErrorCodeCountTokenFailed {

@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const managedUsageWindowPrefix = "caoliao:managed-token"
+const (
+	managedUsageWindowPrefix    = "caoliao:managed-token"
+	managedUsageTwoHourDuration = 2 * time.Hour
+)
 
 var managedUsageLocation = time.FixedZone("Asia/Shanghai", 8*60*60)
 
@@ -45,46 +48,59 @@ var (
 )
 
 const managedUsageSingleRedisScript = `
-local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+local window_ttl = tonumber(ARGV[3])
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  redis.call('SET', KEYS[1], '1', 'EX', window_ttl)
+end
+local remaining = redis.call('TTL', KEYS[1])
+if remaining < 1 then
+  redis.call('SET', KEYS[1], '1', 'EX', window_ttl)
+  remaining = window_ttl
+end
+local current = tonumber(redis.call('GET', KEYS[2]) or '0')
 local requested = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
-local ttl = tonumber(ARGV[3])
 if current + requested > limit then
-  local remaining = redis.call('TTL', KEYS[1])
-  if remaining < 1 then remaining = ttl end
   return {0, remaining}
 end
-local updated = redis.call('INCRBY', KEYS[1], requested)
-if updated == requested then redis.call('EXPIRE', KEYS[1], ttl) end
-local remaining = redis.call('TTL', KEYS[1])
-if remaining < 1 then remaining = ttl end
+local updated = redis.call('INCRBY', KEYS[2], requested)
+if updated == requested then redis.call('EXPIRE', KEYS[2], remaining) end
 return {1, remaining}`
 
 const managedUsageTokenRedisScript = `
 local requested = tonumber(ARGV[1])
 local two_hour_limit = tonumber(ARGV[2])
 local daily_limit = tonumber(ARGV[3])
-local two_hour_ttl = tonumber(ARGV[4])
+local window_ttl = tonumber(ARGV[4])
 local daily_ttl = tonumber(ARGV[5])
-local two_hour_current = tonumber(redis.call('GET', KEYS[1]) or '0')
-local daily_current = tonumber(redis.call('GET', KEYS[2]) or '0')
+local two_hour_ttl = window_ttl
+if two_hour_limit > 0 then
+  if redis.call('EXISTS', KEYS[1]) == 0 then
+    redis.call('SET', KEYS[1], '1', 'EX', window_ttl)
+  end
+  two_hour_ttl = redis.call('TTL', KEYS[1])
+  if two_hour_ttl < 1 then
+    redis.call('SET', KEYS[1], '1', 'EX', window_ttl)
+    two_hour_ttl = window_ttl
+  end
+end
+local two_hour_current = tonumber(redis.call('GET', KEYS[2]) or '0')
+local daily_current = tonumber(redis.call('GET', KEYS[3]) or '0')
 if two_hour_limit > 0 and two_hour_current + requested > two_hour_limit then
-  local remaining = redis.call('TTL', KEYS[1])
-  if remaining < 1 then remaining = two_hour_ttl end
-  return {0, 1, remaining}
+  return {0, 1, two_hour_ttl}
 end
 if daily_limit > 0 and daily_current + requested > daily_limit then
-  local remaining = redis.call('TTL', KEYS[2])
+  local remaining = redis.call('TTL', KEYS[3])
   if remaining < 1 then remaining = daily_ttl end
   return {0, 2, remaining}
 end
 if two_hour_limit > 0 then
-  local updated = redis.call('INCRBY', KEYS[1], requested)
-  if updated == requested then redis.call('EXPIRE', KEYS[1], two_hour_ttl) end
+  local updated = redis.call('INCRBY', KEYS[2], requested)
+  if updated == requested then redis.call('EXPIRE', KEYS[2], two_hour_ttl) end
 end
 if daily_limit > 0 then
-  local updated = redis.call('INCRBY', KEYS[2], requested)
-  if updated == requested then redis.call('EXPIRE', KEYS[2], daily_ttl) end
+  local updated = redis.call('INCRBY', KEYS[3], requested)
+  if updated == requested then redis.call('EXPIRE', KEYS[3], daily_ttl) end
 end
 return {1, 0, 0}`
 
@@ -106,14 +122,14 @@ func ReserveManagedRequestLimit(ctx context.Context, tokenID int, limit int, now
 	if limit <= 0 {
 		return ManagedUsageLimitResult{Allowed: true}, nil
 	}
-	_, end, bucket := managedTwoHourWindow(now)
-	key := fmt.Sprintf("%s:requests-2h:%d:%s", managedUsageWindowPrefix, tokenID, bucket)
-	ttl := managedWindowTTL(now, end)
+	windowKey := fmt.Sprintf("%s:window-2h:%d", managedUsageWindowPrefix, tokenID)
+	requestKey := fmt.Sprintf("%s:requests-2h:%d", managedUsageWindowPrefix, tokenID)
+	windowTTL := int64(managedUsageTwoHourDuration / time.Second)
 	if RedisEnabled {
 		if RDB == nil {
 			return ManagedUsageLimitResult{}, fmt.Errorf("redis is enabled but unavailable")
 		}
-		result, err := RDB.Eval(ctx, managedUsageSingleRedisScript, []string{key}, 1, limit, ttl).Result()
+		result, err := RDB.Eval(ctx, managedUsageSingleRedisScript, []string{windowKey, requestKey}, 1, limit, windowTTL).Result()
 		if err != nil {
 			return ManagedUsageLimitResult{}, err
 		}
@@ -123,19 +139,26 @@ func ReserveManagedRequestLimit(ctx context.Context, tokenID int, limit int, now
 		}
 		return ManagedUsageLimitResult{Allowed: values[0] == 1, RetryAfter: values[1], Exceeded: ManagedUsageLimitRequests2H}, nil
 	}
-	allowed, retryAfter := reserveManagedMemoryWindow(key, limit, 1, end, now)
-	return ManagedUsageLimitResult{Allowed: allowed, RetryAfter: retryAfter, Exceeded: ManagedUsageLimitRequests2H}, nil
+	managedUsageMemoryMu.Lock()
+	defer managedUsageMemoryMu.Unlock()
+	pruneManagedMemoryWindows(now)
+	end := managedMemoryTwoHourEnd(windowKey, now)
+	if managedMemoryWouldExceed(requestKey, limit, 1) {
+		return ManagedUsageLimitResult{Allowed: false, RetryAfter: managedRetryAfter(now, end), Exceeded: ManagedUsageLimitRequests2H}, nil
+	}
+	addManagedMemoryUsage(requestKey, 1, end)
+	return ManagedUsageLimitResult{Allowed: true, RetryAfter: managedRetryAfter(now, end), Exceeded: ManagedUsageLimitRequests2H}, nil
 }
 
 func ReserveManagedTokenLimits(ctx context.Context, tokenID int, twoHourLimit int, dailyLimit int, requested int, now time.Time) (ManagedUsageLimitResult, error) {
 	if requested <= 0 || (twoHourLimit <= 0 && dailyLimit <= 0) {
 		return ManagedUsageLimitResult{Allowed: true}, nil
 	}
-	_, twoHourEnd, twoHourBucket := managedTwoHourWindow(now)
 	_, dayEnd, dayBucket := managedDailyWindow(now)
-	twoHourKey := fmt.Sprintf("%s:tokens-2h:%d:%s", managedUsageWindowPrefix, tokenID, twoHourBucket)
+	windowKey := fmt.Sprintf("%s:window-2h:%d", managedUsageWindowPrefix, tokenID)
+	twoHourKey := fmt.Sprintf("%s:tokens-2h:%d", managedUsageWindowPrefix, tokenID)
 	dailyKey := fmt.Sprintf("%s:tokens-day:%d:%s", managedUsageWindowPrefix, tokenID, dayBucket)
-	twoHourTTL := managedWindowTTL(now, twoHourEnd)
+	windowTTL := int64(managedUsageTwoHourDuration / time.Second)
 	dailyTTL := managedWindowTTL(now, dayEnd)
 	reservation := &ManagedUsageReservation{Reserved: requested}
 	if twoHourLimit > 0 {
@@ -149,7 +172,7 @@ func ReserveManagedTokenLimits(ctx context.Context, tokenID int, twoHourLimit in
 		if RDB == nil {
 			return ManagedUsageLimitResult{}, fmt.Errorf("redis is enabled but unavailable")
 		}
-		result, err := RDB.Eval(ctx, managedUsageTokenRedisScript, []string{twoHourKey, dailyKey}, requested, twoHourLimit, dailyLimit, twoHourTTL, dailyTTL).Result()
+		result, err := RDB.Eval(ctx, managedUsageTokenRedisScript, []string{windowKey, twoHourKey, dailyKey}, requested, twoHourLimit, dailyLimit, windowTTL, dailyTTL).Result()
 		if err != nil {
 			return ManagedUsageLimitResult{}, err
 		}
@@ -170,6 +193,10 @@ func ReserveManagedTokenLimits(ctx context.Context, tokenID int, twoHourLimit in
 	managedUsageMemoryMu.Lock()
 	defer managedUsageMemoryMu.Unlock()
 	pruneManagedMemoryWindows(now)
+	var twoHourEnd time.Time
+	if twoHourLimit > 0 {
+		twoHourEnd = managedMemoryTwoHourEnd(windowKey, now)
+	}
 	if twoHourLimit > 0 && managedMemoryWouldExceed(twoHourKey, twoHourLimit, requested) {
 		return ManagedUsageLimitResult{Allowed: false, RetryAfter: managedRetryAfter(now, twoHourEnd), Exceeded: ManagedUsageLimitTokens2H}, nil
 	}
@@ -228,12 +255,6 @@ func ReconcileManagedTokenLimits(ctx context.Context, reservation *ManagedUsageR
 	return nil
 }
 
-func managedTwoHourWindow(now time.Time) (time.Time, time.Time, string) {
-	local := now.In(managedUsageLocation)
-	start := time.Date(local.Year(), local.Month(), local.Day(), (local.Hour()/2)*2, 0, 0, 0, managedUsageLocation)
-	return start, start.Add(2 * time.Hour), start.Format("2006010215")
-}
-
 func managedDailyWindow(now time.Time) (time.Time, time.Time, string) {
 	local := now.In(managedUsageLocation)
 	start := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, managedUsageLocation)
@@ -256,15 +277,14 @@ func managedRetryAfter(now time.Time, end time.Time) int64 {
 	return retry
 }
 
-func reserveManagedMemoryWindow(key string, limit int, requested int, end time.Time, now time.Time) (bool, int64) {
-	managedUsageMemoryMu.Lock()
-	defer managedUsageMemoryMu.Unlock()
-	pruneManagedMemoryWindows(now)
-	if managedMemoryWouldExceed(key, limit, requested) {
-		return false, managedRetryAfter(now, end)
+func managedMemoryTwoHourEnd(windowKey string, now time.Time) time.Time {
+	window, ok := managedUsageMemoryWindows[windowKey]
+	if ok && now.Before(window.expiresAt) {
+		return window.expiresAt
 	}
-	addManagedMemoryUsage(key, requested, end)
-	return true, managedRetryAfter(now, end)
+	end := now.Add(managedUsageTwoHourDuration)
+	managedUsageMemoryWindows[windowKey] = managedUsageMemoryWindow{expiresAt: end}
+	return end
 }
 
 func managedMemoryWouldExceed(key string, limit int, requested int) bool {

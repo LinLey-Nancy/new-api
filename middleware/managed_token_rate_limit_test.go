@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,7 +45,8 @@ func TestEnforceManagedTokenRequestLimitReturnsOpenAI429(t *testing.T) {
 	assert.False(t, EnforceManagedTokenRequestLimit(second))
 	assert.Equal(t, http.StatusTooManyRequests, secondRecorder.Code)
 	assert.NotEmpty(t, secondRecorder.Header().Get("Retry-After"))
-	assert.Contains(t, secondRecorder.Body.String(), `"code":"rate_limit_exceeded"`)
+	assert.Contains(t, secondRecorder.Body.String(), `"code":"caoliao_requests_2h_limit_exceeded"`)
+	assert.Contains(t, secondRecorder.Body.String(), "Two-hour dynamic request quota exhausted")
 	assert.Equal(t, "deepseek-v4-flash",
 		common.GetContextKeyString(second, constant.ContextKeyOriginalModel))
 
@@ -71,9 +73,9 @@ func TestReserveManagedOutputTokenLimitsUsesOutputOnlyAndPerKeyBudget(t *testing
 	}
 
 	first := newContext(9_201)
-	allowed, _, err := ReserveManagedOutputTokenLimits(first, 60)
+	result, err := ReserveManagedOutputTokenLimits(first, 60)
 	require.NoError(t, err)
-	assert.True(t, allowed)
+	assert.True(t, result.Allowed)
 	value, ok := common.GetContextKey(first, constant.ContextKeyManagedUsageReservation)
 	require.True(t, ok)
 	reservation, ok := value.(*common.ManagedUsageReservation)
@@ -81,13 +83,34 @@ func TestReserveManagedOutputTokenLimitsUsesOutputOnlyAndPerKeyBudget(t *testing
 	require.NoError(t, common.ReconcileManagedTokenLimits(first.Request.Context(), reservation, 20))
 
 	second := newContext(9_201)
-	allowed, retryAfter, err := ReserveManagedOutputTokenLimits(second, 81)
+	result, err = ReserveManagedOutputTokenLimits(second, 81)
 	require.NoError(t, err)
-	assert.False(t, allowed, "20 actual output + 81 reserved output must exceed the two-hour output limit")
-	assert.Positive(t, retryAfter)
+	assert.False(t, result.Allowed, "20 actual output + 81 reserved output must exceed the two-hour output limit")
+	assert.Positive(t, result.RetryAfter)
+	assert.Equal(t, common.ManagedUsageLimitTokens2H, result.Exceeded)
 
 	otherKey := newContext(9_202)
-	allowed, _, err = ReserveManagedOutputTokenLimits(otherKey, 100)
+	result, err = ReserveManagedOutputTokenLimits(otherKey, 100)
 	require.NoError(t, err)
-	assert.True(t, allowed, "different managed keys must not share output-token counters")
+	assert.True(t, result.Allowed, "different managed keys must not share output-token counters")
+}
+
+func TestManagedUsageLimitErrorsExposeStableClientCodes(t *testing.T) {
+	tests := []struct {
+		kind    common.ManagedUsageLimitKind
+		code    types.ErrorCode
+		message string
+	}{
+		{common.ManagedUsageLimitRequests2H, CaoliaoRequestsTwoHourLimitCode, "Two-hour dynamic request quota"},
+		{common.ManagedUsageLimitTokens2H, CaoliaoOutputTwoHourLimitCode, "Two-hour dynamic output token quota"},
+		{common.ManagedUsageLimitTokensDaily, CaoliaoOutputDailyLimitCode, "Daily fixed output token quota"},
+	}
+	for _, test := range tests {
+		t.Run(string(test.kind), func(t *testing.T) {
+			code, message := ManagedUsageLimitError(test.kind, 321)
+			assert.Equal(t, test.code, code)
+			assert.Contains(t, message, test.message)
+			assert.Contains(t, message, "321 seconds")
+		})
+	}
 }
