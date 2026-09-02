@@ -155,16 +155,17 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if meta != nil {
 		maxOutputTokens = meta.MaxTokens
 	}
-	allowed, retryAfter, err := middleware.ReserveManagedOutputTokenLimits(c, maxOutputTokens)
+	managedLimit, err := middleware.ReserveManagedOutputTokenLimits(c, maxOutputTokens)
 	if err != nil {
 		newAPIError = types.NewErrorWithStatusCode(err, types.ErrorCode("rate_limit_check_failed"), http.StatusInternalServerError, types.ErrOptionWithSkipRetry(), types.ErrOptionWithNoRecordErrorLog())
 		return
 	}
-	if !allowed {
-		c.Header("Retry-After", fmt.Sprintf("%d", retryAfter))
+	if !managedLimit.Allowed {
+		c.Header("Retry-After", fmt.Sprintf("%d", managedLimit.RetryAfter))
+		code, message := middleware.ManagedUsageLimitError(managedLimit.Exceeded, managedLimit.RetryAfter)
 		newAPIError = types.NewErrorWithStatusCode(
-			fmt.Errorf("API key token limit exceeded"),
-			types.ErrorCode("rate_limit_exceeded"),
+			fmt.Errorf("%s", message),
+			code,
 			http.StatusTooManyRequests,
 			types.ErrOptionWithSkipRetry(),
 			types.ErrOptionWithNoRecordErrorLog(),
