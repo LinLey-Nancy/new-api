@@ -44,6 +44,21 @@ type CaoliaoDailyUsage struct {
 	RateLimitErrors    int64  `json:"rate_limit_errors" gorm:"column:rate_limit_errors"`
 }
 
+// CaoliaoTokenModelUsage splits one managed token's usage by model. The daily
+// view cannot answer "how much did this key spend on each model", because it
+// aggregates that dimension away; this shape keeps both. It intentionally
+// carries no token name: callers must resolve identity from their own record.
+type CaoliaoTokenModelUsage struct {
+	TokenId            int    `json:"token_id" gorm:"column:token_id"`
+	ModelName          string `json:"model_id" gorm:"column:model_name"`
+	SuccessfulRequests int64  `json:"successes" gorm:"column:successful_requests"`
+	FailedRequests     int64  `json:"failures" gorm:"column:failed_requests"`
+	InputTokens        int64  `json:"input_tokens" gorm:"column:input_tokens"`
+	OutputTokens       int64  `json:"output_tokens" gorm:"column:output_tokens"`
+	ChargedTokens      int64  `json:"charged_tokens" gorm:"column:charged_tokens"`
+	RateLimitErrors    int64  `json:"rate_limit_errors" gorm:"column:rate_limit_errors"`
+}
+
 // EnsureCaoliaoEmployee returns the non-interactive New API user associated
 // with an employee. The deterministic username makes repeated/concurrent calls
 // idempotent without exposing the New API user ID as a business identifier.
@@ -264,6 +279,40 @@ func QueryCaoliaoDailyUsage(tokenIDs []int, modelNames []string, startAt int64, 
 		Where("type IN ?", []int{LogTypeConsume, LogTypeError}).
 		Group("model_name, usage_day").
 		Order("usage_day ASC, model_name ASC").
+		Scan(&rows).Error
+	return rows, err
+}
+
+// QueryCaoliaoTokenModelUsage returns metadata-only usage grouped by managed
+// token and model. Unlike the daily view it needs no date expression, so it is
+// dialect-independent and stays correct on every supported log database.
+func QueryCaoliaoTokenModelUsage(tokenIDs []int, modelNames []string, startAt int64, endAt int64) ([]CaoliaoTokenModelUsage, error) {
+	if len(tokenIDs) == 0 || len(modelNames) == 0 {
+		return []CaoliaoTokenModelUsage{}, nil
+	}
+	var rows []CaoliaoTokenModelUsage
+	err := LOG_DB.Model(&Log{}).
+		Select(`token_id, model_name,
+			COALESCE(SUM(CASE WHEN type = ? THEN 1 ELSE 0 END), 0) AS successful_requests,
+			COALESCE(SUM(CASE WHEN type = ? THEN 1 ELSE 0 END), 0) AS failed_requests,
+			COALESCE(SUM(CASE WHEN type = ? THEN prompt_tokens ELSE 0 END), 0) AS input_tokens,
+			COALESCE(SUM(CASE WHEN type = ? THEN completion_tokens ELSE 0 END), 0) AS output_tokens,
+			COALESCE(SUM(CASE WHEN type = ? THEN quota ELSE 0 END), 0) AS charged_tokens,
+			COALESCE(SUM(CASE WHEN type = ? AND content IN (?, ?, ?, ?, ?) THEN 1 ELSE 0 END), 0) AS rate_limit_errors`,
+			LogTypeConsume,
+			LogTypeError,
+			LogTypeConsume,
+			LogTypeConsume,
+			LogTypeConsume,
+			LogTypeError, "caoliao_rate_limit:rpm", "caoliao_rate_limit:tpm",
+			"caoliao_rate_limit:requests_2h", "caoliao_rate_limit:tokens_2h",
+			"caoliao_rate_limit:tokens_daily").
+		Where("token_id IN ?", tokenIDs).
+		Where("model_name IN ?", modelNames).
+		Where("created_at >= ? AND created_at <= ?", startAt, endAt).
+		Where("type IN ?", []int{LogTypeConsume, LogTypeError}).
+		Group("token_id, model_name").
+		Order("token_id ASC, model_name ASC").
 		Scan(&rows).Error
 	return rows, err
 }

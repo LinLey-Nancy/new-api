@@ -26,6 +26,15 @@ type caoliaoUsageTrendModel struct {
 	Daily   []caoliaoUsageTrendPoint `json:"daily"`
 }
 
+// caoliaoUsageTokenBreakdown splits one token's usage by model so the control
+// plane can show "this key spent this much on that model". It is additive and
+// only emitted when the caller explicitly asks for it.
+type caoliaoUsageTokenBreakdown struct {
+	TokenId int    `json:"token_id"`
+	ModelId string `json:"model_id"`
+	caoliaoUsageMetrics
+}
+
 type caoliaoMockUsageRequest struct {
 	Dataset string                 `json:"dataset"`
 	Replace bool                   `json:"replace"`
@@ -113,6 +122,14 @@ func getCaoliaoTrendUsage(c *gin.Context, tokens []*model.Token, startAt int64, 
 	if len(modelNames) == 0 {
 		modelNames = []string{"deepseek-v4-flash", "qwen3.6"}
 	}
+	// Allow-listed on purpose: a typo must fail loudly instead of silently
+	// omitting a section the caller believes it asked for.
+	include := strings.TrimSpace(c.Query("include"))
+	if include != "" && include != "tokens" {
+		caoliaoError(c, http.StatusBadRequest, "invalid include")
+		return
+	}
+	wantTokens := include == "tokens"
 	tokenIDs := make([]int, 0, len(tokens))
 	for _, token := range tokens {
 		tokenIDs = append(tokenIDs, token.Id)
@@ -155,10 +172,34 @@ func getCaoliaoTrendUsage(c *gin.Context, tokens []*model.Token, startAt int64, 
 			ModelID: modelName, Summary: modelSummaries[modelName], Daily: points,
 		})
 	}
-	common.ApiSuccess(c, gin.H{
+	payload := gin.H{
 		"period": "daily", "timezone": "Asia/Shanghai",
 		"start": startAt, "end": endAt, "summary": summary, "models": models,
-	})
+	}
+	if wantTokens {
+		breakdown, err := model.QueryCaoliaoTokenModelUsage(tokenIDs, modelNames, startAt, endAt)
+		if err != nil {
+			caoliaoInternalError(c, err)
+			return
+		}
+		rows := make([]caoliaoUsageTokenBreakdown, 0, len(breakdown))
+		for _, row := range breakdown {
+			rows = append(rows, caoliaoUsageTokenBreakdown{
+				TokenId: row.TokenId, ModelId: row.ModelName,
+				caoliaoUsageMetrics: caoliaoUsageMetrics{
+					Requests:        row.SuccessfulRequests + row.FailedRequests,
+					InputTokens:     row.InputTokens,
+					OutputTokens:    row.OutputTokens,
+					ChargedTokens:   row.ChargedTokens,
+					Successes:       row.SuccessfulRequests,
+					Failures:        row.FailedRequests,
+					RateLimitErrors: row.RateLimitErrors,
+				},
+			})
+		}
+		payload["tokens"] = rows
+	}
+	common.ApiSuccess(c, payload)
 }
 
 func addCaoliaoUsageMetrics(total *caoliaoUsageMetrics, item caoliaoUsageMetrics) {
