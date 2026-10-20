@@ -35,6 +35,28 @@ type caoliaoUsageTokenBreakdown struct {
 	caoliaoUsageMetrics
 }
 
+// caoliaoUsageChannelSeries is the channel-dimension counterpart of
+// caoliaoUsageTrendModel. Only channel_id identifies a series: model names are
+// informational and may change over the queried window without splitting the
+// series.
+type caoliaoUsageChannelSeries struct {
+	SeriesID    string                   `json:"series_id"`
+	ChannelID   int                      `json:"channel_id"`
+	ChannelName string                   `json:"channel_name"`
+	Status      int                      `json:"status"`
+	ModelNames  []string                 `json:"model_names"`
+	LatestModel string                   `json:"latest_model"`
+	Summary     caoliaoUsageMetrics      `json:"summary"`
+	Daily       []caoliaoUsageTrendPoint `json:"daily"`
+}
+
+type caoliaoUsageTokenChannelBreakdown struct {
+	TokenId   int    `json:"token_id"`
+	SeriesID  string `json:"series_id"`
+	ChannelID int    `json:"channel_id"`
+	caoliaoUsageMetrics
+}
+
 type caoliaoMockUsageRequest struct {
 	Dataset string                 `json:"dataset"`
 	Replace bool                   `json:"replace"`
@@ -114,13 +136,13 @@ func filterCaoliaoUsageTokens(c *gin.Context, tokens []*model.Token) ([]*model.T
 }
 
 func getCaoliaoTrendUsage(c *gin.Context, tokens []*model.Token, startAt int64, endAt int64) {
-	modelNames, ok := caoliaoCSV(c.Query("models"), 20, caoliaoUsageNamePattern)
-	if !ok {
-		caoliaoError(c, http.StatusBadRequest, "invalid models")
+	// dimension selects the grouping identity. "model" keeps the historical
+	// behaviour untouched for the employee portal; "channel" groups by
+	// channel_id so a channel rename cannot split or hide its history.
+	dimension := strings.TrimSpace(c.Query("dimension"))
+	if dimension != "" && dimension != "channel" {
+		caoliaoError(c, http.StatusBadRequest, "invalid dimension")
 		return
-	}
-	if len(modelNames) == 0 {
-		modelNames = []string{"deepseek-v4-flash", "qwen3.6"}
 	}
 	// Allow-listed on purpose: a typo must fail loudly instead of silently
 	// omitting a section the caller believes it asked for.
@@ -133,6 +155,18 @@ func getCaoliaoTrendUsage(c *gin.Context, tokens []*model.Token, startAt int64, 
 	tokenIDs := make([]int, 0, len(tokens))
 	for _, token := range tokens {
 		tokenIDs = append(tokenIDs, token.Id)
+	}
+	if dimension == "channel" {
+		getCaoliaoChannelTrendUsage(c, tokenIDs, startAt, endAt, wantTokens)
+		return
+	}
+	modelNames, ok := caoliaoCSV(c.Query("models"), 20, caoliaoUsageNamePattern)
+	if !ok {
+		caoliaoError(c, http.StatusBadRequest, "invalid models")
+		return
+	}
+	if len(modelNames) == 0 {
+		modelNames = []string{"deepseek-v4-flash", "qwen3.6"}
 	}
 	rows, err := model.QueryCaoliaoDailyUsage(tokenIDs, modelNames, startAt, endAt)
 	if err != nil {
@@ -198,6 +232,137 @@ func getCaoliaoTrendUsage(c *gin.Context, tokens []*model.Token, startAt int64, 
 			})
 		}
 		payload["tokens"] = rows
+	}
+	common.ApiSuccess(c, payload)
+}
+
+// getCaoliaoChannelTrendUsage builds one series per channel. The query returns
+// one row per (channel, model, day); rows are merged here rather than in SQL so
+// the statement stays free of dialect-specific aggregation.
+func getCaoliaoChannelTrendUsage(c *gin.Context, tokenIDs []int, startAt int64, endAt int64, wantTokens bool) {
+	rows, err := model.QueryCaoliaoDailyUsageByChannel(tokenIDs, startAt, endAt)
+	if err != nil {
+		caoliaoInternalError(c, err)
+		return
+	}
+
+	type channelAggregate struct {
+		daily       map[string]caoliaoUsageMetrics
+		summary     caoliaoUsageMetrics
+		modelNames  map[string]bool
+		latestDay   string
+		latestModel string
+	}
+	aggregates := make(map[int]*channelAggregate)
+	channelIDs := make([]int, 0)
+	summary := caoliaoUsageMetrics{}
+	for _, row := range rows {
+		metrics := caoliaoUsageMetrics{
+			Requests:        row.SuccessfulRequests + row.FailedRequests,
+			InputTokens:     row.InputTokens,
+			OutputTokens:    row.OutputTokens,
+			ChargedTokens:   row.ChargedTokens,
+			Successes:       row.SuccessfulRequests,
+			Failures:        row.FailedRequests,
+			RateLimitErrors: row.RateLimitErrors,
+		}
+		aggregate, ok := aggregates[row.ChannelId]
+		if !ok {
+			aggregate = &channelAggregate{
+				daily:      make(map[string]caoliaoUsageMetrics),
+				modelNames: make(map[string]bool),
+			}
+			aggregates[row.ChannelId] = aggregate
+			channelIDs = append(channelIDs, row.ChannelId)
+		}
+		point := aggregate.daily[row.UsageDay]
+		addCaoliaoUsageMetrics(&point, metrics)
+		aggregate.daily[row.UsageDay] = point
+		addCaoliaoUsageMetrics(&aggregate.summary, metrics)
+		if row.ModelName != "" {
+			aggregate.modelNames[row.ModelName] = true
+		}
+		// Rows arrive ordered by usage_day, so the last model seen on the newest
+		// day is the one the channel was running at the end of the window.
+		if row.UsageDay >= aggregate.latestDay {
+			aggregate.latestDay = row.UsageDay
+			aggregate.latestModel = row.ModelName
+		}
+		addCaoliaoUsageMetrics(&summary, metrics)
+	}
+
+	info, err := model.GetCaoliaoChannelInfo(channelIDs)
+	if err != nil {
+		caoliaoInternalError(c, err)
+		return
+	}
+
+	sort.Ints(channelIDs)
+	series := make([]caoliaoUsageChannelSeries, 0, len(channelIDs))
+	for _, channelID := range channelIDs {
+		aggregate := aggregates[channelID]
+		days := make([]string, 0, len(aggregate.daily))
+		for day := range aggregate.daily {
+			days = append(days, day)
+		}
+		sort.Strings(days)
+		points := make([]caoliaoUsageTrendPoint, 0, len(days))
+		for _, day := range days {
+			points = append(points, caoliaoUsageTrendPoint{
+				Date: day, caoliaoUsageMetrics: aggregate.daily[day],
+			})
+		}
+		names := make([]string, 0, len(aggregate.modelNames))
+		for name := range aggregate.modelNames {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		channelName := ""
+		status := 0
+		if record, found := info[channelID]; found {
+			channelName = record.Name
+			status = record.Status
+		}
+		series = append(series, caoliaoUsageChannelSeries{
+			SeriesID:    "channel:" + strconv.Itoa(channelID),
+			ChannelID:   channelID,
+			ChannelName: channelName,
+			Status:      status,
+			ModelNames:  names,
+			LatestModel: aggregate.latestModel,
+			Summary:     aggregate.summary,
+			Daily:       points,
+		})
+	}
+
+	payload := gin.H{
+		"period": "daily", "timezone": "Asia/Shanghai", "dimension": "channel",
+		"start": startAt, "end": endAt, "summary": summary, "series": series,
+	}
+	if wantTokens {
+		breakdown, err := model.QueryCaoliaoTokenChannelUsage(tokenIDs, startAt, endAt)
+		if err != nil {
+			caoliaoInternalError(c, err)
+			return
+		}
+		tokenRows := make([]caoliaoUsageTokenChannelBreakdown, 0, len(breakdown))
+		for _, row := range breakdown {
+			tokenRows = append(tokenRows, caoliaoUsageTokenChannelBreakdown{
+				TokenId:   row.TokenId,
+				SeriesID:  "channel:" + strconv.Itoa(row.ChannelId),
+				ChannelID: row.ChannelId,
+				caoliaoUsageMetrics: caoliaoUsageMetrics{
+					Requests:        row.SuccessfulRequests + row.FailedRequests,
+					InputTokens:     row.InputTokens,
+					OutputTokens:    row.OutputTokens,
+					ChargedTokens:   row.ChargedTokens,
+					Successes:       row.SuccessfulRequests,
+					Failures:        row.FailedRequests,
+					RateLimitErrors: row.RateLimitErrors,
+				},
+			})
+		}
+		payload["tokens"] = tokenRows
 	}
 	common.ApiSuccess(c, payload)
 }

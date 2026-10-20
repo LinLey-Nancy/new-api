@@ -123,6 +123,116 @@ func TestQueryCaoliaoDailyUsageGroupsByShanghaiDayAndModel(t *testing.T) {
 	assert.Equal(t, "qwen3.6", usage[1].ModelName)
 }
 
+// A channel keeps its identity while its model name changes. Grouping by
+// channel is what makes the history continuous across such a rename.
+func TestQueryCaoliaoDailyUsageByChannelMergesRenamedModels(t *testing.T) {
+	previousDB, previousLogDB := DB, LOG_DB
+	db, err := gorm.Open(sqlite.Open("file:caoliao-channel-main-test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	logDB, err := gorm.Open(sqlite.Open("file:caoliao-channel-log-test?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, logDB.AutoMigrate(&Log{}))
+	DB, LOG_DB = db, logDB
+	t.Cleanup(func() { DB, LOG_DB = previousDB, previousLogDB })
+
+	day1 := time.Date(2026, 9, 20, 16, 30, 0, 0, time.UTC).Unix() // 2026-09-21 00:30 +08
+	day2 := day1 + 24*60*60
+	logs := []Log{
+		{TokenId: 7, ChannelId: 3, CreatedAt: day1, Type: LogTypeConsume, ModelName: "deepseek-v4-flash", PromptTokens: 100, CompletionTokens: 20, Quota: 120},
+		{TokenId: 7, ChannelId: 3, CreatedAt: day1 + 10, Type: LogTypeError, ModelName: "deepseek-v4-flash"},
+		{TokenId: 7, ChannelId: 3, CreatedAt: day2, Type: LogTypeConsume, ModelName: "DeepSeek-V4-Flash-w8a8-mtp", PromptTokens: 50, CompletionTokens: 10, Quota: 60},
+		{TokenId: 8, ChannelId: 1, CreatedAt: day2, Type: LogTypeConsume, ModelName: "qwen3.6", PromptTokens: 7, CompletionTokens: 3, Quota: 10},
+		// channel_id = 0 是未归属渠道的记录，必须完全排除。
+		{TokenId: 7, ChannelId: 0, CreatedAt: day2, Type: LogTypeError, ModelName: "caoliao_rate_limit:tpm"},
+		{TokenId: 8, ChannelId: 0, CreatedAt: day2, Type: LogTypeConsume, ModelName: "whisper", PromptTokens: 1, CompletionTokens: 1, Quota: 2},
+		// 未授权 token 也不进统计。
+		{TokenId: 99, ChannelId: 3, CreatedAt: day2, Type: LogTypeConsume, ModelName: "deepseek-v4-flash", PromptTokens: 999, CompletionTokens: 999, Quota: 1998},
+	}
+	require.NoError(t, logDB.Create(&logs).Error)
+
+	rows, err := QueryCaoliaoDailyUsageByChannel([]int{7, 8}, day1-60, day2+60)
+	require.NoError(t, err)
+	require.Len(t, rows, 3)
+
+	assert.Equal(t, 3, rows[0].ChannelId)
+	assert.Equal(t, "2026-09-21", rows[0].UsageDay)
+	assert.Equal(t, "deepseek-v4-flash", rows[0].ModelName)
+	assert.EqualValues(t, 1, rows[0].SuccessfulRequests)
+	assert.EqualValues(t, 1, rows[0].FailedRequests)
+	assert.EqualValues(t, 100, rows[0].InputTokens)
+
+	assert.Equal(t, 1, rows[1].ChannelId)
+	assert.Equal(t, "2026-09-22", rows[1].UsageDay)
+	assert.Equal(t, "qwen3.6", rows[1].ModelName)
+
+	assert.Equal(t, 3, rows[2].ChannelId)
+	assert.Equal(t, "2026-09-22", rows[2].UsageDay)
+	assert.Equal(t, "DeepSeek-V4-Flash-w8a8-mtp", rows[2].ModelName)
+
+	var swept int64
+	for _, row := range rows {
+		swept += row.SuccessfulRequests + row.FailedRequests
+	}
+	assert.EqualValues(t, 4, swept, "只有 2 枚 token × 2 个渠道归属正确的记录")
+}
+
+func TestQueryCaoliaoTokenChannelUsageGroupsByChannel(t *testing.T) {
+	previousDB, previousLogDB := DB, LOG_DB
+	db, err := gorm.Open(sqlite.Open("file:caoliao-channel-token-main?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	logDB, err := gorm.Open(sqlite.Open("file:caoliao-channel-token-log?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, logDB.AutoMigrate(&Log{}))
+	DB, LOG_DB = db, logDB
+	t.Cleanup(func() { DB, LOG_DB = previousDB, previousLogDB })
+
+	at := time.Date(2026, 9, 21, 2, 0, 0, 0, time.UTC).Unix()
+	logs := []Log{
+		{TokenId: 7, ChannelId: 3, CreatedAt: at, Type: LogTypeConsume, ModelName: "deepseek-v4-flash", PromptTokens: 10, CompletionTokens: 2, Quota: 12},
+		{TokenId: 7, ChannelId: 3, CreatedAt: at + 1, Type: LogTypeConsume, ModelName: "DeepSeek-V4-Flash-w8a8-mtp", PromptTokens: 20, CompletionTokens: 4, Quota: 24},
+		{TokenId: 7, ChannelId: 0, CreatedAt: at + 2, Type: LogTypeError, ModelName: "caoliao_rate_limit:tpm"},
+	}
+	require.NoError(t, logDB.Create(&logs).Error)
+
+	rows, err := QueryCaoliaoTokenChannelUsage([]int{7}, at-60, at+60)
+	require.NoError(t, err)
+	require.Len(t, rows, 1, "同一枚 Key 在同一渠道上的两个模型名必须合并")
+	assert.Equal(t, 7, rows[0].TokenId)
+	assert.Equal(t, 3, rows[0].ChannelId)
+	assert.EqualValues(t, 2, rows[0].SuccessfulRequests)
+	assert.EqualValues(t, 0, rows[0].FailedRequests)
+	assert.EqualValues(t, 30, rows[0].InputTokens)
+	assert.EqualValues(t, 6, rows[0].OutputTokens)
+}
+
+func TestListCaoliaoChannelsReturnsEnabledChannelsOnly(t *testing.T) {
+	previousDB := DB
+	db, err := gorm.Open(sqlite.Open("file:caoliao-channel-list-main?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&Channel{}))
+	DB = db
+	t.Cleanup(func() { DB = previousDB })
+
+	require.NoError(t, db.Create(&Channel{Id: 1, Key: "ch1", Name: "Qwen", Models: "qwen3.6", Status: common.ChannelStatusEnabled}).Error)
+	require.NoError(t, db.Create(&Channel{Id: 3, Key: "ch3", Name: "DeepSeek", Models: "deepseek-v4-flash,DeepSeek-V4-Flash-w8a8-mtp", Status: common.ChannelStatusEnabled}).Error)
+	require.NoError(t, db.Create(&Channel{Id: 5, Key: "ch5", Name: "Off", Models: "retired", Status: common.ChannelStatusManuallyDisabled}).Error)
+
+	channels, err := ListCaoliaoChannels()
+	require.NoError(t, err)
+	require.Len(t, channels, 2)
+	assert.Equal(t, 1, channels[0].Id)
+	assert.Equal(t, []string{"qwen3.6"}, channels[0].Models)
+	assert.Equal(t, 3, channels[1].Id)
+	assert.Equal(t, []string{"deepseek-v4-flash", "DeepSeek-V4-Flash-w8a8-mtp"}, channels[1].Models)
+
+	info, err := GetCaoliaoChannelInfo([]int{1, 3, 5, 9})
+	require.NoError(t, err)
+	assert.Equal(t, "DeepSeek", info[3].Name)
+	assert.Equal(t, common.ChannelStatusManuallyDisabled, info[5].Status)
+	_, present := info[9]
+	assert.False(t, present, "不存在的渠道不能凭空出现")
+}
+
 func TestCaoliaoUsageDayExpressionSupportsEveryLogDatabase(t *testing.T) {
 	tests := []struct {
 		dialect  string

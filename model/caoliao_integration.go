@@ -59,6 +59,54 @@ type CaoliaoTokenModelUsage struct {
 	RateLimitErrors    int64  `json:"rate_limit_errors" gorm:"column:rate_limit_errors"`
 }
 
+// CaoliaoChannelDailyUsage mirrors CaoliaoDailyUsage but keeps channel_id as
+// the grouping dimension. Model names are carried along only so callers can
+// show which name the channel was using on a given day.
+type CaoliaoChannelDailyUsage struct {
+	ChannelId          int    `json:"channel_id" gorm:"column:channel_id"`
+	ModelName          string `json:"model_name" gorm:"column:model_name"`
+	UsageDay           string `json:"date" gorm:"column:usage_day"`
+	SuccessfulRequests int64  `json:"successes" gorm:"column:successful_requests"`
+	FailedRequests     int64  `json:"failures" gorm:"column:failed_requests"`
+	InputTokens        int64  `json:"input_tokens" gorm:"column:input_tokens"`
+	OutputTokens       int64  `json:"output_tokens" gorm:"column:output_tokens"`
+	ChargedTokens      int64  `json:"charged_tokens" gorm:"column:charged_tokens"`
+	RateLimitErrors    int64  `json:"rate_limit_errors" gorm:"column:rate_limit_errors"`
+}
+
+// CaoliaoTokenChannelUsage is the channel-dimension counterpart of
+// CaoliaoTokenModelUsage. Rows are already merged to one row per
+// (token, channel); model names are deliberately not part of the identity so a
+// channel rename cannot split a key's history.
+type CaoliaoTokenChannelUsage struct {
+	TokenId            int   `json:"token_id" gorm:"column:token_id"`
+	ChannelId          int   `json:"channel_id" gorm:"column:channel_id"`
+	SuccessfulRequests int64 `json:"successes" gorm:"column:successful_requests"`
+	FailedRequests     int64 `json:"failures" gorm:"column:failed_requests"`
+	InputTokens        int64 `json:"input_tokens" gorm:"column:input_tokens"`
+	OutputTokens       int64 `json:"output_tokens" gorm:"column:output_tokens"`
+	ChargedTokens      int64 `json:"charged_tokens" gorm:"column:charged_tokens"`
+	RateLimitErrors    int64 `json:"rate_limit_errors" gorm:"column:rate_limit_errors"`
+}
+
+// CaoliaoChannel is the control plane's view of an enabled routing channel.
+// Models reflects the channel's current configuration, which is what the
+// control plane shows as "the latest model id".
+type CaoliaoChannel struct {
+	Id     int      `json:"id"`
+	Name   string   `json:"name"`
+	Models []string `json:"models"`
+	Status int      `json:"status"`
+}
+
+// CaoliaoChannelInfo is the lightweight channel identity used to label usage
+// series. Status is zero when the channel no longer exists.
+type CaoliaoChannelInfo struct {
+	Id     int    `json:"id"`
+	Name   string `json:"name"`
+	Status int    `json:"status"`
+}
+
 // EnsureCaoliaoEmployee returns the non-interactive New API user associated
 // with an employee. The deterministic username makes repeated/concurrent calls
 // idempotent without exposing the New API user ID as a business identifier.
@@ -315,6 +363,135 @@ func QueryCaoliaoTokenModelUsage(tokenIDs []int, modelNames []string, startAt in
 		Order("token_id ASC, model_name ASC").
 		Scan(&rows).Error
 	return rows, err
+}
+
+// QueryCaoliaoDailyUsageByChannel aggregates the same billing and error rows as
+// QueryCaoliaoDailyUsage, but groups by channel instead of model name. That is
+// what keeps a channel's history continuous across model renames: only
+// channel_id is stable, the model name on a channel is not.
+//
+// Rows with channel_id = 0 are excluded on purpose: they are requests that were
+// rejected before any channel was chosen (rate limits, invalid tokens), so they
+// belong to no series and would only make the totals disagree with the charts.
+//
+// The model name is part of the grouping key rather than an aggregate so this
+// query needs no dialect-specific string aggregation; callers merge the rows in
+// Go. Grouping is the only place a dialect expression is used, exactly like
+// QueryCaoliaoDailyUsage.
+func QueryCaoliaoDailyUsageByChannel(tokenIDs []int, startAt int64, endAt int64) ([]CaoliaoChannelDailyUsage, error) {
+	if len(tokenIDs) == 0 {
+		return []CaoliaoChannelDailyUsage{}, nil
+	}
+	dayExpression, err := caoliaoUsageDayExpression(LOG_DB.Dialector.Name())
+	if err != nil {
+		return nil, err
+	}
+	var rows []CaoliaoChannelDailyUsage
+	err = LOG_DB.Model(&Log{}).
+		Select(fmt.Sprintf(`channel_id, model_name, %s AS usage_day,
+			COALESCE(SUM(CASE WHEN type = ? THEN 1 ELSE 0 END), 0) AS successful_requests,
+			COALESCE(SUM(CASE WHEN type = ? THEN 1 ELSE 0 END), 0) AS failed_requests,
+			COALESCE(SUM(CASE WHEN type = ? THEN prompt_tokens ELSE 0 END), 0) AS input_tokens,
+			COALESCE(SUM(CASE WHEN type = ? THEN completion_tokens ELSE 0 END), 0) AS output_tokens,
+			COALESCE(SUM(CASE WHEN type = ? THEN quota ELSE 0 END), 0) AS charged_tokens,
+			COALESCE(SUM(CASE WHEN type = ? AND content IN (?, ?, ?, ?, ?) THEN 1 ELSE 0 END), 0) AS rate_limit_errors`, dayExpression),
+			LogTypeConsume,
+			LogTypeError,
+			LogTypeConsume,
+			LogTypeConsume,
+			LogTypeConsume,
+			LogTypeError, "caoliao_rate_limit:rpm", "caoliao_rate_limit:tpm",
+			"caoliao_rate_limit:requests_2h", "caoliao_rate_limit:tokens_2h",
+			"caoliao_rate_limit:tokens_daily").
+		Where("token_id IN ?", tokenIDs).
+		Where("channel_id > 0").
+		Where("created_at >= ? AND created_at <= ?", startAt, endAt).
+		Where("type IN ?", []int{LogTypeConsume, LogTypeError}).
+		Group("channel_id, model_name, usage_day").
+		Order("usage_day ASC, channel_id ASC, model_name ASC").
+		Scan(&rows).Error
+	return rows, err
+}
+
+// QueryCaoliaoTokenChannelUsage returns per-key usage grouped by channel. Like
+// its model-dimension counterpart it needs no date expression, so it stays
+// dialect-independent. The model name is intentionally not part of the grouping
+// key, so a channel rename cannot split one key's row in two.
+func QueryCaoliaoTokenChannelUsage(tokenIDs []int, startAt int64, endAt int64) ([]CaoliaoTokenChannelUsage, error) {
+	if len(tokenIDs) == 0 {
+		return []CaoliaoTokenChannelUsage{}, nil
+	}
+	var rows []CaoliaoTokenChannelUsage
+	err := LOG_DB.Model(&Log{}).
+		Select(`token_id, channel_id,
+			COALESCE(SUM(CASE WHEN type = ? THEN 1 ELSE 0 END), 0) AS successful_requests,
+			COALESCE(SUM(CASE WHEN type = ? THEN 1 ELSE 0 END), 0) AS failed_requests,
+			COALESCE(SUM(CASE WHEN type = ? THEN prompt_tokens ELSE 0 END), 0) AS input_tokens,
+			COALESCE(SUM(CASE WHEN type = ? THEN completion_tokens ELSE 0 END), 0) AS output_tokens,
+			COALESCE(SUM(CASE WHEN type = ? THEN quota ELSE 0 END), 0) AS charged_tokens,
+			COALESCE(SUM(CASE WHEN type = ? AND content IN (?, ?, ?, ?, ?) THEN 1 ELSE 0 END), 0) AS rate_limit_errors`,
+			LogTypeConsume,
+			LogTypeError,
+			LogTypeConsume,
+			LogTypeConsume,
+			LogTypeConsume,
+			LogTypeError, "caoliao_rate_limit:rpm", "caoliao_rate_limit:tpm",
+			"caoliao_rate_limit:requests_2h", "caoliao_rate_limit:tokens_2h",
+			"caoliao_rate_limit:tokens_daily").
+		Where("token_id IN ?", tokenIDs).
+		Where("channel_id > 0").
+		Where("created_at >= ? AND created_at <= ?", startAt, endAt).
+		Where("type IN ?", []int{LogTypeConsume, LogTypeError}).
+		Group("token_id, channel_id").
+		Order("token_id ASC, channel_id ASC").
+		Scan(&rows).Error
+	return rows, err
+}
+
+// ListCaoliaoChannels returns the current enabled routing channels. It reads
+// the main database, because channels always live there even when logs are
+// stored in a separate LOG_DB.
+func ListCaoliaoChannels() ([]CaoliaoChannel, error) {
+	var channels []Channel
+	err := DB.Model(&Channel{}).
+		Select("id, name, models, status").
+		Where("status = ?", common.ChannelStatusEnabled).
+		Order("id ASC").
+		Find(&channels).Error
+	if err != nil {
+		return nil, err
+	}
+	result := make([]CaoliaoChannel, 0, len(channels))
+	for _, channel := range channels {
+		result = append(result, CaoliaoChannel{
+			Id:     channel.Id,
+			Name:   channel.Name,
+			Models: channel.GetModels(),
+			Status: channel.Status,
+		})
+	}
+	return result, nil
+}
+
+// GetCaoliaoChannelInfo resolves channel identity for usage series. Missing ids
+// are simply absent from the map; callers treat that as "channel deleted".
+func GetCaoliaoChannelInfo(ids []int) (map[int]CaoliaoChannelInfo, error) {
+	result := make(map[int]CaoliaoChannelInfo, len(ids))
+	if len(ids) == 0 {
+		return result, nil
+	}
+	var rows []CaoliaoChannelInfo
+	err := DB.Model(&Channel{}).
+		Select("id, name, status").
+		Where("id IN ?", ids).
+		Find(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		result[row.Id] = row
+	}
+	return result, nil
 }
 
 func caoliaoUsageDayExpression(dialect string) (string, error) {

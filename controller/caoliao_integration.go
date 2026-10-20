@@ -96,6 +96,21 @@ func GetCaoliaoHealth(c *gin.Context) {
 	})
 }
 
+// GetCaoliaoChannels exposes the enabled routing channels together with the
+// model names they currently serve. The control plane uses this to label usage
+// series and to let an operator refresh the "latest model id" it displays.
+func GetCaoliaoChannels(c *gin.Context) {
+	channels, err := model.ListCaoliaoChannels()
+	if err != nil {
+		caoliaoInternalError(c, err)
+		return
+	}
+	common.ApiSuccess(c, gin.H{
+		"channels":   channels,
+		"checked_at": common.GetTimestamp(),
+	})
+}
+
 func PutCaoliaoEmployee(c *gin.Context) {
 	employeeID, ok := caoliaoEmployeeID(c)
 	if !ok {
