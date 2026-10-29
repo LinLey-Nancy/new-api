@@ -165,9 +165,7 @@ func getCaoliaoTrendUsage(c *gin.Context, tokens []*model.Token, startAt int64, 
 		caoliaoError(c, http.StatusBadRequest, "invalid models")
 		return
 	}
-	if len(modelNames) == 0 {
-		modelNames = []string{"deepseek-v4-flash", "qwen3.6"}
-	}
+	allModels := len(modelNames) == 0
 	rows, err := model.QueryCaoliaoDailyUsage(tokenIDs, modelNames, startAt, endAt)
 	if err != nil {
 		caoliaoInternalError(c, err)
@@ -195,6 +193,18 @@ func getCaoliaoTrendUsage(c *gin.Context, tokens []*model.Token, startAt int64, 
 		modelSummaries[row.ModelName] = current
 		addCaoliaoUsageMetrics(&summary, metrics)
 	}
+	if allModels {
+		// Without an explicit filter, return every model present in the window
+		// instead of assuming the deployment only serves two historical names.
+		seen := make(map[string]bool, len(rows))
+		for _, row := range rows {
+			if !seen[row.ModelName] {
+				seen[row.ModelName] = true
+				modelNames = append(modelNames, row.ModelName)
+			}
+		}
+		sort.Strings(modelNames)
+	}
 	models := make([]caoliaoUsageTrendModel, 0, len(modelNames))
 	for _, modelName := range modelNames {
 		points := byModel[modelName]
@@ -211,7 +221,11 @@ func getCaoliaoTrendUsage(c *gin.Context, tokens []*model.Token, startAt int64, 
 		"start": startAt, "end": endAt, "summary": summary, "models": models,
 	}
 	if wantTokens {
-		breakdown, err := model.QueryCaoliaoTokenModelUsage(tokenIDs, modelNames, startAt, endAt)
+		breakdownModels := modelNames
+		if allModels {
+			breakdownModels = nil
+		}
+		breakdown, err := model.QueryCaoliaoTokenModelUsage(tokenIDs, breakdownModels, startAt, endAt)
 		if err != nil {
 			caoliaoInternalError(c, err)
 			return

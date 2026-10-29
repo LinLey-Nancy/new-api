@@ -74,6 +74,7 @@ type caoliaoUsageItem struct {
 	TokenId    int    `json:"token_id"`
 	TokenName  string `json:"token_name"`
 	EmployeeId string `json:"employee_id"`
+	Deleted    bool   `json:"deleted"`
 	Period     string `json:"period"`
 	Start      int64  `json:"start"`
 	End        int64  `json:"end"`
@@ -346,6 +347,10 @@ func GetCaoliaoUsage(c *gin.Context) {
 		return
 	}
 	employeeID := strings.TrimSpace(c.Query("employee_id"))
+	includeDeleted, includeDeletedOK := caoliaoIncludeDeleted(c)
+	if !includeDeletedOK {
+		return
+	}
 	var tokens []*model.Token
 	var err error
 	if employeeID != "" {
@@ -353,9 +358,17 @@ func GetCaoliaoUsage(c *gin.Context) {
 			caoliaoError(c, http.StatusBadRequest, "invalid employee_id")
 			return
 		}
-		tokens, err = model.ListCaoliaoTokensByEmployee(employeeID)
+		if includeDeleted {
+			tokens, err = model.ListCaoliaoTokensByEmployeeIncludingDeleted(employeeID)
+		} else {
+			tokens, err = model.ListCaoliaoTokensByEmployee(employeeID)
+		}
 	} else {
-		tokens, err = model.ListAllCaoliaoTokens()
+		if includeDeleted {
+			tokens, err = model.ListAllCaoliaoTokensIncludingDeleted()
+		} else {
+			tokens, err = model.ListAllCaoliaoTokens()
+		}
 	}
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		caoliaoError(c, http.StatusNotFound, "employee not found")
@@ -416,6 +429,7 @@ func GetCaoliaoUsage(c *gin.Context) {
 			TokenId:             token.Id,
 			TokenName:           token.Name,
 			EmployeeId:          employeeIDs[token.UserId],
+			Deleted:             token.DeletedAt.Valid,
 			Period:              "custom",
 			Start:               startAt,
 			End:                 endAt,
@@ -540,6 +554,21 @@ func validCaoliaoEmployeeID(employeeID string) bool {
 		}
 	}
 	return true
+}
+
+// caoliaoIncludeDeleted is an explicit opt-in for historical usage of
+// soft-deleted managed keys. Omitting it keeps the pre-existing behaviour of
+// listing only live tokens.
+func caoliaoIncludeDeleted(c *gin.Context) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(c.Query("include_deleted"))) {
+	case "", "0", "false":
+		return false, true
+	case "1", "true":
+		return true, true
+	default:
+		caoliaoError(c, http.StatusBadRequest, "invalid include_deleted")
+		return false, false
+	}
 }
 
 func caoliaoUsageRange(c *gin.Context) (int64, int64, bool) {

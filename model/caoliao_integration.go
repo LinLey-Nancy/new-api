@@ -200,9 +200,38 @@ func ListCaoliaoTokensByUserID(userID int) ([]*Token, error) {
 	return tokens, err
 }
 
+// ListCaoliaoTokensByEmployeeIncludingDeleted is used only by the usage
+// endpoint when the caller explicitly asks for historical data of deleted
+// managed keys. Key-management callers must keep using the default-scope
+// variant so deleted keys never reappear in the key list.
+func ListCaoliaoTokensByEmployeeIncludingDeleted(employeeID string) ([]*Token, error) {
+	user, err := GetCaoliaoEmployee(employeeID)
+	if err != nil {
+		return nil, err
+	}
+	return ListCaoliaoTokensByUserIDIncludingDeleted(user.Id)
+}
+
+// Unscoped only disables GORM's soft-delete filter; the user_id and
+// managed_by predicates remain mandatory so a deleted token can never leak
+// into another employee's scope.
+func ListCaoliaoTokensByUserIDIncludingDeleted(userID int) ([]*Token, error) {
+	var tokens []*Token
+	err := DB.Unscoped().Where("user_id = ? AND managed_by = ?", userID, CaoliaoManagedBy).
+		Order("id DESC").Find(&tokens).Error
+	return tokens, err
+}
+
 func ListAllCaoliaoTokens() ([]*Token, error) {
 	var tokens []*Token
 	err := DB.Where("managed_by = ?", CaoliaoManagedBy).Order("id DESC").Find(&tokens).Error
+	return tokens, err
+}
+
+func ListAllCaoliaoTokensIncludingDeleted() ([]*Token, error) {
+	var tokens []*Token
+	err := DB.Unscoped().Where("managed_by = ?", CaoliaoManagedBy).
+		Order("id DESC").Find(&tokens).Error
 	return tokens, err
 }
 
@@ -296,8 +325,9 @@ func QueryCaoliaoUsage(tokenIDs []int, startAt int64, endAt int64) ([]CaoliaoUsa
 // QueryCaoliaoDailyUsage returns metadata-only daily aggregates in the
 // deployment's reporting timezone (Asia/Shanghai). It deliberately excludes
 // prompts and responses and only accepts already-authorized managed token IDs.
+// An empty modelNames slice means all models in the window.
 func QueryCaoliaoDailyUsage(tokenIDs []int, modelNames []string, startAt int64, endAt int64) ([]CaoliaoDailyUsage, error) {
-	if len(tokenIDs) == 0 || len(modelNames) == 0 {
+	if len(tokenIDs) == 0 {
 		return []CaoliaoDailyUsage{}, nil
 	}
 	dayExpression, err := caoliaoUsageDayExpression(LOG_DB.Dialector.Name())
@@ -305,7 +335,7 @@ func QueryCaoliaoDailyUsage(tokenIDs []int, modelNames []string, startAt int64, 
 		return nil, err
 	}
 	var rows []CaoliaoDailyUsage
-	err = LOG_DB.Model(&Log{}).
+	query := LOG_DB.Model(&Log{}).
 		Select(fmt.Sprintf(`model_name, %s AS usage_day,
 			COALESCE(SUM(CASE WHEN type = ? THEN 1 ELSE 0 END), 0) AS successful_requests,
 			COALESCE(SUM(CASE WHEN type = ? THEN 1 ELSE 0 END), 0) AS failed_requests,
@@ -322,10 +352,14 @@ func QueryCaoliaoDailyUsage(tokenIDs []int, modelNames []string, startAt int64, 
 			"caoliao_rate_limit:requests_2h", "caoliao_rate_limit:tokens_2h",
 			"caoliao_rate_limit:tokens_daily").
 		Where("token_id IN ?", tokenIDs).
-		Where("model_name IN ?", modelNames).
 		Where("created_at >= ? AND created_at <= ?", startAt, endAt).
-		Where("type IN ?", []int{LogTypeConsume, LogTypeError}).
-		Group("model_name, usage_day").
+		Where("type IN ?", []int{LogTypeConsume, LogTypeError})
+	// An empty model list means "all models"; a caller must not silently fall
+	// back to historical hard-coded names when the deployment renames a model.
+	if len(modelNames) > 0 {
+		query = query.Where("model_name IN ?", modelNames)
+	}
+	err = query.Group("model_name, usage_day").
 		Order("usage_day ASC, model_name ASC").
 		Scan(&rows).Error
 	return rows, err
@@ -334,12 +368,13 @@ func QueryCaoliaoDailyUsage(tokenIDs []int, modelNames []string, startAt int64, 
 // QueryCaoliaoTokenModelUsage returns metadata-only usage grouped by managed
 // token and model. Unlike the daily view it needs no date expression, so it is
 // dialect-independent and stays correct on every supported log database.
+// An empty modelNames slice means all models in the window.
 func QueryCaoliaoTokenModelUsage(tokenIDs []int, modelNames []string, startAt int64, endAt int64) ([]CaoliaoTokenModelUsage, error) {
-	if len(tokenIDs) == 0 || len(modelNames) == 0 {
+	if len(tokenIDs) == 0 {
 		return []CaoliaoTokenModelUsage{}, nil
 	}
 	var rows []CaoliaoTokenModelUsage
-	err := LOG_DB.Model(&Log{}).
+	query := LOG_DB.Model(&Log{}).
 		Select(`token_id, model_name,
 			COALESCE(SUM(CASE WHEN type = ? THEN 1 ELSE 0 END), 0) AS successful_requests,
 			COALESCE(SUM(CASE WHEN type = ? THEN 1 ELSE 0 END), 0) AS failed_requests,
@@ -356,10 +391,12 @@ func QueryCaoliaoTokenModelUsage(tokenIDs []int, modelNames []string, startAt in
 			"caoliao_rate_limit:requests_2h", "caoliao_rate_limit:tokens_2h",
 			"caoliao_rate_limit:tokens_daily").
 		Where("token_id IN ?", tokenIDs).
-		Where("model_name IN ?", modelNames).
 		Where("created_at >= ? AND created_at <= ?", startAt, endAt).
-		Where("type IN ?", []int{LogTypeConsume, LogTypeError}).
-		Group("token_id, model_name").
+		Where("type IN ?", []int{LogTypeConsume, LogTypeError})
+	if len(modelNames) > 0 {
+		query = query.Where("model_name IN ?", modelNames)
+	}
+	err := query.Group("token_id, model_name").
 		Order("token_id ASC, model_name ASC").
 		Scan(&rows).Error
 	return rows, err

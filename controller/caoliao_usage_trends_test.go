@@ -65,6 +65,45 @@ func TestCaoliaoMockUsageFeedsTrendInterface(t *testing.T) {
 	assert.Len(t, data["models"], 2)
 }
 
+func TestCaoliaoTrendUsageWithoutModelFilterReturnsAllModels(t *testing.T) {
+	db := useCaoliaoUsageTestDB(t)
+	user := model.User{Username: "all-models-user", Password: "unused", DisplayName: "All Models", Status: 1, Quota: 1000}
+	require.NoError(t, db.Create(&user).Error)
+	token := model.Token{UserId: user.Id, Key: "all-models-key", Name: "All Models Key", Status: 1,
+		ManagedBy: model.CaoliaoManagedBy, ExpiredTime: -1}
+	require.NoError(t, db.Create(&token).Error)
+	occurredAt := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC).Unix()
+	logs := []model.Log{
+		{TokenId: token.Id, ChannelId: 3, CreatedAt: occurredAt, Type: model.LogTypeConsume,
+			ModelName: "DeepSeek-V4-Flash-w8a8-mtp", PromptTokens: 100, CompletionTokens: 10, Quota: 10},
+		{TokenId: token.Id, ChannelId: 3, CreatedAt: occurredAt + 1, Type: model.LogTypeConsume,
+			ModelName: "default", PromptTokens: 200, CompletionTokens: 20, Quota: 20},
+	}
+	require.NoError(t, db.Create(&logs).Error)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/usage", GetCaoliaoUsage)
+	request := httptest.NewRequest(http.MethodGet,
+		"/usage?view=trend&include=tokens&start=2026-08-20&end=2026-08-20", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	decoded := map[string]any{}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &decoded))
+	data := decoded["data"].(map[string]any)
+	assert.EqualValues(t, 2, data["summary"].(map[string]any)["requests"])
+	models := data["models"].([]any)
+	require.Len(t, models, 2)
+	names := map[string]bool{}
+	for _, raw := range models {
+		names[raw.(map[string]any)["model_id"].(string)] = true
+	}
+	assert.True(t, names["DeepSeek-V4-Flash-w8a8-mtp"])
+	assert.True(t, names["default"])
+	assert.Len(t, data["tokens"], 2)
+}
+
 func TestCaoliaoMockUsageIsDisabledByDefault(t *testing.T) {
 	useCaoliaoUsageTestDB(t)
 	t.Setenv("CAOLIAO_ENABLE_MOCK_USAGE", "false")
@@ -293,6 +332,104 @@ func TestCaoliaoTrendUsageRejectsInvalidOrUnmanagedTokenFilters(t *testing.T) {
 			assert.Contains(t, response.Body.String(), test.wantBody)
 		})
 	}
+}
+
+func TestCaoliaoUsageIncludesDeletedManagedTokensWhenRequested(t *testing.T) {
+	db := useCaoliaoUsageTestDB(t)
+	user, err := model.EnsureCaoliaoEmployee("E-DELETED", "Deleted History")
+	require.NoError(t, err)
+	active := model.Token{UserId: user.Id, Key: "active-key", Name: "Active Key", Status: 1,
+		ManagedBy: model.CaoliaoManagedBy, ExpiredTime: -1}
+	deleted := model.Token{UserId: user.Id, Key: "deleted-key", Name: "Deleted Key", Status: 1,
+		ManagedBy: model.CaoliaoManagedBy, ExpiredTime: -1}
+	require.NoError(t, db.Create(&active).Error)
+	require.NoError(t, db.Create(&deleted).Error)
+	require.NoError(t, db.Delete(&deleted).Error)
+	require.NoError(t, db.Create(&model.Channel{Id: 3, Key: "ch3", Name: "Test Channel",
+		Models: "DeepSeek-V4-Flash-w8a8-mtp", Status: common.ChannelStatusEnabled}).Error)
+
+	occurredAt := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC).Unix()
+	logs := []model.Log{
+		{TokenId: active.Id, ChannelId: 3, CreatedAt: occurredAt, Type: model.LogTypeConsume,
+			ModelName: "DeepSeek-V4-Flash-w8a8-mtp", PromptTokens: 100, CompletionTokens: 10, Quota: 10},
+		{TokenId: deleted.Id, ChannelId: 3, CreatedAt: occurredAt + 1, Type: model.LogTypeConsume,
+			ModelName: "DeepSeek-V4-Flash-w8a8-mtp", PromptTokens: 200, CompletionTokens: 20, Quota: 20},
+	}
+	require.NoError(t, db.Create(&logs).Error)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.GET("/usage", GetCaoliaoUsage)
+	router.GET("/employees/:employee_id/keys", GetCaoliaoEmployeeKeys)
+	readUsage := func(query string) (int, map[string]any) {
+		request := httptest.NewRequest(http.MethodGet, "/usage?"+query, nil)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			return response.Code, nil
+		}
+		decoded := map[string]any{}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &decoded))
+		data, _ := decoded["data"].(map[string]any)
+		return response.Code, data
+	}
+
+	status, data := readUsage("employee_id=E-DELETED&start=2026-08-20&end=2026-08-20")
+	require.Equal(t, http.StatusOK, status)
+	require.Len(t, data["items"], 1)
+	assert.EqualValues(t, 1, data["summary"].(map[string]any)["requests"])
+
+	status, data = readUsage("employee_id=E-DELETED&include_deleted=1&start=2026-08-20&end=2026-08-20")
+	require.Equal(t, http.StatusOK, status)
+	items := data["items"].([]any)
+	require.Len(t, items, 2)
+	deletedSeen := false
+	for _, raw := range items {
+		item := raw.(map[string]any)
+		if int(item["token_id"].(float64)) == deleted.Id {
+			assert.Equal(t, true, item["deleted"])
+			deletedSeen = true
+		}
+	}
+	assert.True(t, deletedSeen)
+	assert.EqualValues(t, 2, data["summary"].(map[string]any)["requests"])
+
+	status, data = readUsage("employee_id=E-DELETED&include_deleted=1&view=trend&dimension=channel&start=2026-08-20&end=2026-08-20")
+	require.Equal(t, http.StatusOK, status)
+	assert.EqualValues(t, 2, data["summary"].(map[string]any)["requests"])
+	series, ok := data["series"].([]any)
+	require.True(t, ok)
+	require.Len(t, series, 1)
+	assert.EqualValues(t, 2, series[0].(map[string]any)["summary"].(map[string]any)["requests"])
+
+	bad := httptest.NewRequest(http.MethodGet,
+		"/usage?employee_id=E-DELETED&include_deleted=maybe&start=2026-08-20&end=2026-08-20", nil)
+	badResponse := httptest.NewRecorder()
+	router.ServeHTTP(badResponse, bad)
+	assert.Equal(t, http.StatusBadRequest, badResponse.Code)
+	assert.Contains(t, badResponse.Body.String(), "invalid include_deleted")
+
+	keysRequest := httptest.NewRequest(http.MethodGet, "/employees/E-DELETED/keys?include_deleted=1", nil)
+	keysResponse := httptest.NewRecorder()
+	router.ServeHTTP(keysResponse, keysRequest)
+	require.Equal(t, http.StatusOK, keysResponse.Code)
+	keysDecoded := map[string]any{}
+	require.NoError(t, json.Unmarshal(keysResponse.Body.Bytes(), &keysDecoded))
+	keysData := keysDecoded["data"].(map[string]any)
+	assert.Len(t, keysData["items"], 1)
+
+	other, err := model.EnsureCaoliaoEmployee("E-OTHER", "Other")
+	require.NoError(t, err)
+	otherToken := model.Token{UserId: other.Id, Key: "other-key", Name: "Other Key", Status: 1,
+		ManagedBy: model.CaoliaoManagedBy, ExpiredTime: -1}
+	require.NoError(t, db.Create(&otherToken).Error)
+	require.NoError(t, db.Delete(&otherToken).Error)
+	cross := httptest.NewRequest(http.MethodGet, "/usage?employee_id=E-DELETED&include_deleted=1&token_id="+
+		strconv.Itoa(otherToken.Id)+"&start=2026-08-20&end=2026-08-20", nil)
+	crossResponse := httptest.NewRecorder()
+	router.ServeHTTP(crossResponse, cross)
+	assert.Equal(t, http.StatusNotFound, crossResponse.Code)
+	assert.Contains(t, crossResponse.Body.String(), "key not found")
 }
 
 // dimension=channel 存在的理由：模型名只是渠道上的一个可变属性。同一渠道换了
