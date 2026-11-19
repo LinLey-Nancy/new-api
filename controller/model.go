@@ -298,6 +298,7 @@ func ListModels(c *gin.Context, modelType int) {
 			"nextPageToken": nil,
 		})
 	default:
+		publishModelContextWindows(c, ownerGroups, userOpenAiModels)
 		c.JSON(200, gin.H{
 			"success": true,
 			"data":    userOpenAiModels,

@@ -304,8 +304,8 @@ func sanitizeFetchModelsError(err error, key string) error {
 	return errors.New(message)
 }
 
-func getFetchModelsResponseBody(method string, requestURL string, channel *model.Channel, headers http.Header) ([]byte, error) {
-	request, err := http.NewRequest(method, requestURL, nil)
+func getFetchModelsResponseBody(ctx context.Context, method string, requestURL string, channel *model.Channel, headers http.Header, byteLimit int64) ([]byte, error) {
+	request, err := http.NewRequestWithContext(ctx, method, requestURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -328,6 +328,13 @@ func getFetchModelsResponseBody(method string, requestURL string, channel *model
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("status code: %d", response.StatusCode)
+	}
+	if byteLimit > 0 {
+		body, err := io.ReadAll(io.LimitReader(response.Body, byteLimit+1))
+		if int64(len(body)) > byteLimit {
+			return nil, errors.New("upstream model list is too large")
+		}
+		return body, err
 	}
 	return io.ReadAll(response.Body)
 }
@@ -407,7 +414,7 @@ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
 		return nil, sanitizeFetchModelsError(err, key)
 	}
 
-	body, err := getFetchModelsResponseBody(http.MethodGet, url, channel, headers)
+	body, err := getFetchModelsResponseBody(context.Background(), http.MethodGet, url, channel, headers, 0)
 	if err != nil {
 		return nil, sanitizeFetchModelsError(err, key)
 	}
@@ -425,13 +432,7 @@ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
 	return normalizeModelNames(ids), nil
 }
 
-func fetchAdvancedCustomUpstreamModelIDs(channel *model.Channel, baseURL string) ([]string, error) {
-	key, _, apiErr := channel.GetNextEnabledKey()
-	if apiErr != nil {
-		return nil, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
-	}
-	key = strings.TrimSpace(key)
-
+func buildAdvancedCustomModelsRequest(channel *model.Channel, baseURL, key string) (string, http.Header, error) {
 	info := &relaycommon.RelayInfo{
 		RelayFormat:    types.RelayFormatOpenAI,
 		RelayMode:      relayconstant.RelayModeUnknown,
@@ -447,13 +448,25 @@ func fetchAdvancedCustomUpstreamModelIDs(channel *model.Channel, baseURL string)
 	adaptor := &advancedcustom.Adaptor{}
 	url, headers, err := adaptor.BuildModelListRequest(info)
 	if err != nil {
-		return nil, sanitizeFetchModelsError(err, key)
+		return "", nil, sanitizeFetchModelsError(err, key)
 	}
 	if err := applyFetchModelsHeaderOverrides(channel, key, headers); err != nil {
-		return nil, sanitizeFetchModelsError(err, key)
+		return "", nil, sanitizeFetchModelsError(err, key)
 	}
+	return url, headers, nil
+}
 
-	body, err := getFetchModelsResponseBody(http.MethodGet, url, channel, headers)
+func fetchAdvancedCustomUpstreamModelIDs(channel *model.Channel, baseURL string) ([]string, error) {
+	key, _, apiErr := channel.GetNextEnabledKey()
+	if apiErr != nil {
+		return nil, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
+	}
+	key = strings.TrimSpace(key)
+	url, headers, err := buildAdvancedCustomModelsRequest(channel, baseURL, key)
+	if err != nil {
+		return nil, err
+	}
+	body, err := getFetchModelsResponseBody(context.Background(), http.MethodGet, url, channel, headers, 0)
 	if err != nil {
 		return nil, sanitizeFetchModelsError(err, key)
 	}
