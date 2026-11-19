@@ -25,9 +25,10 @@ const (
 )
 
 type ManagedUsageReservation struct {
-	TwoHourKey string
-	DailyKey   string
-	Reserved   int
+	TwoHourKey       string
+	DailyKey         string
+	Reserved         int
+	dailyExpiresAtMS int64
 }
 
 type ManagedUsageLimitResult struct {
@@ -47,73 +48,96 @@ var (
 	managedUsageMemoryWindows = make(map[string]managedUsageMemoryWindow)
 )
 
-const managedUsageSingleRedisScript = `
-local window_ttl = tonumber(ARGV[3])
-if redis.call('EXISTS', KEYS[1]) == 0 then
-  redis.call('SET', KEYS[1], '1', 'EX', window_ttl)
+const managedUsageTwoHourRedisWindow = `
+local function two_hour_remaining(window_ttl_ms, counter_key)
+  local remaining = redis.call('PTTL', KEYS[1])
+  if remaining < 0 then
+    -- An old counter may have outlived the previous window anchor.
+    redis.call('DEL', KEYS[2], KEYS[3])
+    redis.call('SET', KEYS[1], '1', 'PX', window_ttl_ms)
+    remaining = window_ttl_ms
+  elseif redis.call('PTTL', counter_key) == -1 then
+    -- A persistent counter has no reliable two-hour window attribution.
+    redis.call('DEL', counter_key)
+  end
+  return math.max(1, remaining)
 end
-local remaining = redis.call('TTL', KEYS[1])
-if remaining < 1 then
-  redis.call('SET', KEYS[1], '1', 'EX', window_ttl)
-  remaining = window_ttl
-end
+`
+
+const managedUsageSingleRedisScript = managedUsageTwoHourRedisWindow + `
+local remaining = two_hour_remaining(tonumber(ARGV[3]), KEYS[2])
+local retry_after = math.ceil(remaining / 1000)
 local current = tonumber(redis.call('GET', KEYS[2]) or '0')
 local requested = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
 if current + requested > limit then
-  return {0, remaining}
+  return {0, retry_after}
 end
-local updated = redis.call('INCRBY', KEYS[2], requested)
-if updated == requested then redis.call('EXPIRE', KEYS[2], remaining) end
-return {1, remaining}`
+redis.call('INCRBY', KEYS[2], requested)
+redis.call('PEXPIRE', KEYS[2], remaining)
+return {1, retry_after}`
 
-const managedUsageTokenRedisScript = `
+const managedUsageTokenRedisScript = managedUsageTwoHourRedisWindow + `
 local requested = tonumber(ARGV[1])
 local two_hour_limit = tonumber(ARGV[2])
 local daily_limit = tonumber(ARGV[3])
-local window_ttl = tonumber(ARGV[4])
+local window_ttl_ms = tonumber(ARGV[4])
 local daily_ttl = tonumber(ARGV[5])
-local two_hour_ttl = window_ttl
+local two_hour_ttl = 0
 if two_hour_limit > 0 then
-  if redis.call('EXISTS', KEYS[1]) == 0 then
-    redis.call('SET', KEYS[1], '1', 'EX', window_ttl)
-  end
-  two_hour_ttl = redis.call('TTL', KEYS[1])
-  if two_hour_ttl < 1 then
-    redis.call('SET', KEYS[1], '1', 'EX', window_ttl)
-    two_hour_ttl = window_ttl
+  two_hour_ttl = two_hour_remaining(window_ttl_ms, KEYS[3])
+end
+local daily_key = KEYS[4]
+local daily_remaining = -2
+if daily_limit > 0 then
+  daily_remaining = redis.call('PTTL', daily_key)
+  if daily_remaining == -1 then
+    -- The date in the key identifies its day, so keep its usage.
+    redis.call('EXPIRE', daily_key, daily_ttl)
+    daily_remaining = daily_ttl * 1000
   end
 end
-local two_hour_current = tonumber(redis.call('GET', KEYS[2]) or '0')
-local daily_current = tonumber(redis.call('GET', KEYS[3]) or '0')
+local two_hour_current = tonumber(redis.call('GET', KEYS[3]) or '0')
+local daily_current = tonumber(redis.call('GET', daily_key) or '0')
 if two_hour_limit > 0 and two_hour_current + requested > two_hour_limit then
-  return {0, 1, two_hour_ttl}
+  return {0, 1, math.ceil(two_hour_ttl / 1000)}
 end
 if daily_limit > 0 and daily_current + requested > daily_limit then
-  local remaining = redis.call('TTL', KEYS[3])
-  if remaining < 1 then remaining = daily_ttl end
-  return {0, 2, remaining}
+  local retry_after = daily_ttl
+  if daily_remaining >= 0 then
+    retry_after = math.max(1, math.ceil(daily_remaining / 1000))
+  end
+  return {0, 2, retry_after}
 end
 if two_hour_limit > 0 then
-  local updated = redis.call('INCRBY', KEYS[2], requested)
-  if updated == requested then redis.call('EXPIRE', KEYS[2], two_hour_ttl) end
+  redis.call('INCRBY', KEYS[3], requested)
+  redis.call('PEXPIRE', KEYS[3], two_hour_ttl)
 end
 if daily_limit > 0 then
-  local updated = redis.call('INCRBY', KEYS[3], requested)
-  if updated == requested then redis.call('EXPIRE', KEYS[3], daily_ttl) end
+  redis.call('INCRBY', daily_key, requested)
+  if daily_remaining == -2 then
+    redis.call('EXPIRE', daily_key, daily_ttl)
+  end
 end
 return {1, 0, 0}`
 
 const managedUsageAdjustRedisScript = `
 local delta = tonumber(ARGV[1])
-for index = 1, #KEYS do
-  if redis.call('EXISTS', KEYS[index]) == 1 then
-    local current = tonumber(redis.call('GET', KEYS[index]) or '0')
-    local updated = current + delta
-    if updated < 0 then updated = 0 end
-    local ttl = redis.call('TTL', KEYS[index])
-    redis.call('SET', KEYS[index], updated)
-    if ttl > 0 then redis.call('EXPIRE', KEYS[index], ttl) end
+local daily_key = ARGV[2]
+local daily_expires_at_ms = tonumber(ARGV[3])
+for _, key in ipairs(KEYS) do
+  local ttl = redis.call('PTTL', key)
+  if ttl == -1 then
+    if key ~= daily_key then
+      redis.call('DEL', key)
+    elseif daily_expires_at_ms > 0 then
+      redis.call('PEXPIREAT', key, daily_expires_at_ms)
+      ttl = redis.call('PTTL', key)
+    end
+  end
+  if ttl > 0 then
+    local current = tonumber(redis.call('GET', key) or '0')
+    redis.call('SET', key, math.max(0, current + delta), 'PX', ttl)
   end
 end
 return 1`
@@ -124,12 +148,12 @@ func ReserveManagedRequestLimit(ctx context.Context, tokenID int, limit int, now
 	}
 	windowKey := fmt.Sprintf("%s:window-2h:%d", managedUsageWindowPrefix, tokenID)
 	requestKey := fmt.Sprintf("%s:requests-2h:%d", managedUsageWindowPrefix, tokenID)
-	windowTTL := int64(managedUsageTwoHourDuration / time.Second)
 	if RedisEnabled {
 		if RDB == nil {
 			return ManagedUsageLimitResult{}, fmt.Errorf("redis is enabled but unavailable")
 		}
-		result, err := RDB.Eval(ctx, managedUsageSingleRedisScript, []string{windowKey, requestKey}, 1, limit, windowTTL).Result()
+		twoHourKey := fmt.Sprintf("%s:tokens-2h:%d", managedUsageWindowPrefix, tokenID)
+		result, err := RDB.Eval(ctx, managedUsageSingleRedisScript, []string{windowKey, requestKey, twoHourKey}, 1, limit, managedUsageTwoHourDuration.Milliseconds()).Result()
 		if err != nil {
 			return ManagedUsageLimitResult{}, err
 		}
@@ -158,7 +182,6 @@ func ReserveManagedTokenLimits(ctx context.Context, tokenID int, twoHourLimit in
 	windowKey := fmt.Sprintf("%s:window-2h:%d", managedUsageWindowPrefix, tokenID)
 	twoHourKey := fmt.Sprintf("%s:tokens-2h:%d", managedUsageWindowPrefix, tokenID)
 	dailyKey := fmt.Sprintf("%s:tokens-day:%d:%s", managedUsageWindowPrefix, tokenID, dayBucket)
-	windowTTL := int64(managedUsageTwoHourDuration / time.Second)
 	dailyTTL := managedWindowTTL(now, dayEnd)
 	reservation := &ManagedUsageReservation{Reserved: requested}
 	if twoHourLimit > 0 {
@@ -166,13 +189,15 @@ func ReserveManagedTokenLimits(ctx context.Context, tokenID int, twoHourLimit in
 	}
 	if dailyLimit > 0 {
 		reservation.DailyKey = dailyKey
+		reservation.dailyExpiresAtMS = dayEnd.UnixMilli()
 	}
 
 	if RedisEnabled {
 		if RDB == nil {
 			return ManagedUsageLimitResult{}, fmt.Errorf("redis is enabled but unavailable")
 		}
-		result, err := RDB.Eval(ctx, managedUsageTokenRedisScript, []string{windowKey, twoHourKey, dailyKey}, requested, twoHourLimit, dailyLimit, windowTTL, dailyTTL).Result()
+		requestKey := fmt.Sprintf("%s:requests-2h:%d", managedUsageWindowPrefix, tokenID)
+		result, err := RDB.Eval(ctx, managedUsageTokenRedisScript, []string{windowKey, requestKey, twoHourKey, dailyKey}, requested, twoHourLimit, dailyLimit, managedUsageTwoHourDuration.Milliseconds(), dailyTTL).Result()
 		if err != nil {
 			return ManagedUsageLimitResult{}, err
 		}
@@ -237,7 +262,7 @@ func ReconcileManagedTokenLimits(ctx context.Context, reservation *ManagedUsageR
 		if RDB == nil {
 			return fmt.Errorf("redis is enabled but unavailable")
 		}
-		return RDB.Eval(ctx, managedUsageAdjustRedisScript, keys, delta).Err()
+		return RDB.Eval(ctx, managedUsageAdjustRedisScript, keys, delta, reservation.DailyKey, reservation.dailyExpiresAtMS).Err()
 	}
 	managedUsageMemoryMu.Lock()
 	defer managedUsageMemoryMu.Unlock()

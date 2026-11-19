@@ -67,19 +67,7 @@ func TestManagedTwoHourWindowStartsOnFirstUseAndIsSharedByKeyLimits(t *testing.T
 }
 
 func TestManagedTwoHourWindowUsesSharedRedisAnchor(t *testing.T) {
-	previousRedisEnabled := RedisEnabled
-	previousRedisClient := RDB
-	redisServer := miniredis.RunT(t)
-	redisClient := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
-	require.NoError(t, redisClient.Ping(context.Background()).Err())
-	RedisEnabled = true
-	RDB = redisClient
-	t.Cleanup(func() {
-		_ = redisClient.Close()
-		RedisEnabled = previousRedisEnabled
-		RDB = previousRedisClient
-	})
-
+	redisServer := useManagedUsageTestRedis(t)
 	ctx := context.Background()
 	now := time.Date(2026, 9, 1, 13, 59, 0, 0, managedUsageLocation)
 	first, err := ReserveManagedRequestLimit(ctx, 402, 1, now)
@@ -95,6 +83,135 @@ func TestManagedTwoHourWindowUsesSharedRedisAnchor(t *testing.T) {
 	reset, err := ReserveManagedTokenLimits(ctx, 402, 100, 0, 100, now.Add(2*time.Hour))
 	require.NoError(t, err)
 	assert.True(t, reset.Allowed, "the Redis output counter must expire with the request-created key window")
+}
+
+func useManagedUsageTestRedis(t *testing.T) *miniredis.Miniredis {
+	t.Helper()
+	previousRedisEnabled := RedisEnabled
+	previousRedisClient := RDB
+	redisServer := miniredis.RunT(t)
+	redisClient := redis.NewClient(&redis.Options{Addr: redisServer.Addr()})
+	require.NoError(t, redisClient.Ping(context.Background()).Err())
+	RedisEnabled = true
+	RDB = redisClient
+	t.Cleanup(func() {
+		_ = redisClient.Close()
+		RedisEnabled = previousRedisEnabled
+		RDB = previousRedisClient
+	})
+	return redisServer
+}
+
+func TestManagedRedisReconcilePreservesSubsecondExpiry(t *testing.T) {
+	redisServer := useManagedUsageTestRedis(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 22, 0, 0, 0, managedUsageLocation)
+	first, err := ReserveManagedTokenLimits(ctx, 406, 100, 100, 100, now)
+	require.NoError(t, err)
+	require.True(t, first.Allowed)
+
+	const remaining = 250 * time.Millisecond
+	redisServer.FastForward(2*time.Hour - remaining)
+	require.NoError(t, ReconcileManagedTokenLimits(ctx, first.Reservation, 80))
+	for _, key := range []string{first.Reservation.TwoHourKey, first.Reservation.DailyKey} {
+		assert.Equal(t, remaining, redisServer.TTL(key))
+		assert.Equal(t, "80", RDB.Get(ctx, key).Val())
+	}
+	blocked, err := ReserveManagedTokenLimits(ctx, 406, 100, 100, 21, now.Add(2*time.Hour-remaining))
+	require.NoError(t, err)
+	assert.False(t, blocked.Allowed)
+	assert.Equal(t, ManagedUsageLimitTokens2H, blocked.Exceeded)
+	assert.EqualValues(t, 1, blocked.RetryAfter)
+
+	redisServer.FastForward(remaining)
+	assert.False(t, redisServer.Exists(first.Reservation.TwoHourKey))
+	assert.False(t, redisServer.Exists(first.Reservation.DailyKey))
+}
+
+func TestManagedRedisReservationsDiscardLegacyTwoHourCounters(t *testing.T) {
+	for _, duration := range []time.Duration{0, 30 * time.Minute} {
+		t.Run(duration.String(), func(t *testing.T) {
+			redisServer := useManagedUsageTestRedis(t)
+			ctx := context.Background()
+			now := time.Date(2026, 9, 1, 12, 0, 0, 0, managedUsageLocation)
+			const (
+				windowKey  = "caoliao:managed-token:window-2h:407"
+				requestKey = "caoliao:managed-token:requests-2h:407"
+				outputKey  = "caoliao:managed-token:tokens-2h:407"
+			)
+			if duration > 0 {
+				require.NoError(t, RDB.Set(ctx, windowKey, 1, duration).Err())
+			}
+			require.NoError(t, RDB.Set(ctx, requestKey, 20, 0).Err())
+			var outputTTL time.Duration
+			if duration == 0 {
+				// Older scripts could leave an expiring counter after the anchor expired.
+				outputTTL = time.Second
+			}
+			require.NoError(t, RDB.Set(ctx, outputKey, 976_121, outputTTL).Err())
+
+			request, err := ReserveManagedRequestLimit(ctx, 407, 1, now)
+			require.NoError(t, err)
+			assert.True(t, request.Allowed)
+			output, err := ReserveManagedTokenLimits(ctx, 407, 1_000_000, 0, 65_535, now)
+			require.NoError(t, err)
+			assert.True(t, output.Allowed)
+			wantTTL := duration
+			if wantTTL == 0 {
+				wantTTL = 2 * time.Hour
+			}
+			assert.Equal(t, wantTTL, redisServer.TTL(windowKey))
+			assert.Equal(t, wantTTL, redisServer.TTL(requestKey))
+			assert.Equal(t, wantTTL, redisServer.TTL(outputKey))
+			assert.Equal(t, "1", RDB.Get(ctx, requestKey).Val())
+			assert.Equal(t, "65535", RDB.Get(ctx, outputKey).Val())
+		})
+	}
+}
+
+func TestManagedRedisReconcileDiscardsLegacyPermanentTwoHourCounter(t *testing.T) {
+	redisServer := useManagedUsageTestRedis(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, managedUsageLocation)
+	result, err := ReserveManagedTokenLimits(ctx, 408, 100, 0, 100, now)
+	require.NoError(t, err)
+	require.True(t, result.Allowed)
+	key := result.Reservation.TwoHourKey
+	require.NoError(t, RDB.Persist(ctx, key).Err())
+
+	require.NoError(t, ReconcileManagedTokenLimits(ctx, result.Reservation, 50))
+	assert.False(t, redisServer.Exists(key))
+}
+
+func TestManagedRedisReservationRestoresLegacyDailyExpiry(t *testing.T) {
+	redisServer := useManagedUsageTestRedis(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, managedUsageLocation)
+	const key = "caoliao:managed-token:tokens-day:409:20260901"
+	require.NoError(t, RDB.Set(ctx, key, 95, 0).Err())
+
+	result, err := ReserveManagedTokenLimits(ctx, 409, 0, 100, 10, now)
+	require.NoError(t, err)
+	assert.False(t, result.Allowed)
+	assert.Equal(t, ManagedUsageLimitTokensDaily, result.Exceeded)
+	assert.Equal(t, "95", RDB.Get(ctx, key).Val())
+	assert.Equal(t, 12*time.Hour, redisServer.TTL(key))
+}
+
+func TestManagedRedisReconcileRestoresLegacyDailyExpiry(t *testing.T) {
+	redisServer := useManagedUsageTestRedis(t)
+	ctx := context.Background()
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, managedUsageLocation)
+	redisServer.SetTime(now)
+	result, err := ReserveManagedTokenLimits(ctx, 410, 0, 100, 100, now)
+	require.NoError(t, err)
+	require.True(t, result.Allowed)
+	key := result.Reservation.DailyKey
+	require.NoError(t, RDB.Persist(ctx, key).Err())
+
+	require.NoError(t, ReconcileManagedTokenLimits(ctx, result.Reservation, 70))
+	assert.Equal(t, "70", RDB.Get(ctx, key).Val())
+	assert.Equal(t, 12*time.Hour, redisServer.TTL(key))
 }
 
 func TestManagedTwoHourWindowSharesOutputCreatedRedisAnchorWithRequests(t *testing.T) {
